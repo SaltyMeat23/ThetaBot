@@ -105,6 +105,14 @@ Browser:   open the dashboard → verify health → (when ready) arm live
 ## Step 2 — Spin up a Hostinger VPS
 
 > 💡 **Get a Hostinger VPS here → https://www.hostinger.com?REFERRALCODE=LRBKTHIELNOA** — using this link supports the project at no extra cost to you.
+>
+> ⚡ **Skip the manual install:** when creating the VPS, paste this into Hostinger's **"Post-install script"** field and the server boots with Docker + ThetaBot already set up:
+>
+> ```
+> #!/bin/bash
+> curl -fsSL https://raw.githubusercontent.com/SaltyMeat23/ThetaBot/main/scripts/bootstrap.sh | bash
+> ```
+> *(Requires the repo to be public. Then just SSH in, edit `.env` + `config.yaml`, upload your token, and start it.)*
 
 1. Go to Hostinger → **VPS Hosting** and choose a plan. **KVM 1** (1 vCPU / 4 GB RAM / ~50 GB) is more than enough — the bot uses a tiny fraction of it. KVM 2 gives comfortable headroom if you want it.
 2. **Operating system:** choose **Ubuntu 24.04** (or 22.04). If Hostinger offers an **"Ubuntu with Docker"** template, pick it — Docker comes pre-installed and you can skip part of Step 3.
@@ -119,6 +127,14 @@ Browser:   open the dashboard → verify health → (when ready) arm live
 
 ## Step 3 — Install & deploy
 
+> ### ⚡ Fastest path — one command
+> On a fresh Ubuntu VPS (or if you used the Hostinger post-install script above, this is already done):
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/SaltyMeat23/ThetaBot/main/scripts/bootstrap.sh | bash
+> ```
+> That installs Docker, clones ThetaBot, and creates your `.env` + `config.yaml`. Then jump to editing them below (steps 3 & 5) — you can skip the manual Docker install and clone.
+
+Manual steps (or to understand what the script did):
 On the VPS:
 
 1. **Install Docker** (skip if your template already has it):
