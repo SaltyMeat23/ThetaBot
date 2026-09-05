@@ -12,6 +12,9 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# gosu lets the entrypoint fix bind-mount ownership as root, then drop to appuser.
+RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
+
 # Dependency install first for better layer caching. We editable-install so that
 # config.py's REPO_ROOT (parents[2] of the package file) resolves to /app at runtime,
 # keeping config.yaml at /app/config.yaml and the DB at /app/data/agentic.db.
@@ -24,7 +27,6 @@ RUN pip install --upgrade pip && pip install -e ".[all]"
 RUN mkdir -p /app/data \
     && useradd --create-home --uid 10001 appuser \
     && chown -R appuser:appuser /app
-USER appuser
 
 VOLUME ["/app/data"]
 EXPOSE 8000
@@ -35,4 +37,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 # config.yaml is optional — without it the app falls back to config.example.yaml (paper).
 # Mount your real config at /app/config.yaml (read-only) for live settings.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["agentic", "/app/config.yaml"]
