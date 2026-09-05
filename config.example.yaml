@@ -1,0 +1,170 @@
+# Copy to config.yaml and adjust. Behavior/config only — NO secrets (those live in .env).
+
+# paper | live   (live also requires i_understand_live_trading: true)
+mode: paper
+i_understand_live_trading: false
+
+# Which execution broker to use: paper | robinhood_mcp | robinstocks | alpaca
+broker: paper
+# If the chosen broker can't trade options, fall back to this one (or null to stay read-only).
+broker_fallback: null
+
+# Market data provider: paper | alpaca
+market_data: paper
+
+# Simulated buying power the paper broker reports — set to your REAL account size so the
+# paper soak sizes positions realistically (default 100000 is a large sandbox balance).
+paper_buying_power: 100000
+# Seed fake demo positions into the paper broker. Leave true for local dev; set FALSE on a real
+# paper soak — the demo fixtures otherwise inject phantom collateral that blocks entry sizing
+# and show up as fake positions/P&L on the dashboard.
+paper_seed_positions: true
+
+# Loop cadences (seconds)
+poll_interval_seconds: 60          # monitor loop during market hours
+poll_interval_closed_seconds: 300  # monitor loop when market closed
+reconcile_interval_seconds: 300
+approval_timeout_seconds: 900      # how long an approval request stays valid
+max_quote_age_seconds: 10          # reject quotes older than this when executing
+auto_trip_after_errors: 0          # auto-engage kill switch after N consecutive errors (0=off)
+
+execution:
+  limit_buffer_pct: 0.02     # buy-to-close limit = mid * (1 + buffer)
+  slippage_cap_pct: 0.05     # never pay more than ask * (1 + cap)
+  fill_timeout_seconds: 60
+  reprice_after_seconds: 20
+
+robinhood:
+  # Brokerage account that automated closes route through. MUST be agentic_allowed=true
+  # and option_level_2+ (check via the get_accounts MCP tool). Required for live RH MCP
+  # trading — leave blank and the RH broker stays read-only and falls back.
+  account_number: ""         # your Agentic account number
+
+# CSP auto-entry scanner (the "opening" side). OFF by default. Auto-enters sell-to-open
+# cash-secured puts when a watchlist contract meets criteria — behind the same live-arming
+# gate + kill switch as closes, plus the sizing caps and a real-time-feed requirement below.
+entry:
+  enabled: false             # master switch; scanner does not run unless true
+  watchlist: []              # tickers to scan, e.g. ["MSFT","NVDA","AMD"]
+  feed: indicative           # indicative (delayed, paper) | opra (real-time; REQUIRED for live)
+  scan_interval_seconds: 300
+  earnings_gate: true        # skip a name whose earnings fall within (dte_max + exclude_earnings_days)
+                             # days — never hold a short put through earnings. Enforced only when an
+                             # earnings source is live (RH MCP + ROBINHOOD_MCP_TOKEN); else no-op.
+  criteria:                  # CSP (cash-secured put) screening
+    delta_min: 0.18          # short-put |delta| band
+    delta_max: 0.28
+    dte_min: 7               # weeklies (7-14 DTE) for weekly income
+    dte_max: 14
+    min_annualized_yield: 0.20   # (premium/strike)/dte*365 floor (0.20 = 20%)
+    min_open_interest: 100
+    min_volume: 10
+    max_spread_pct: 0.10     # bid-ask spread as fraction of mid
+    exclude_earnings_days: 7  # (not yet enforced — needs an earnings calendar feed)
+  cc_criteria:               # covered-call screening (strike floor = cost basis, applied at runtime)
+    delta_min: 0.20
+    delta_max: 0.30
+    dte_min: 7
+    dte_max: 14
+    min_annualized_yield: 0.20
+    min_open_interest: 100
+    min_volume: 10
+    max_spread_pct: 0.10
+    exclude_earnings_days: 7
+  sizing:
+    max_position_size_pct: 0.10        # cap each CSP at 10% of account value
+    max_concurrent_positions: 5        # max open CSPs
+    max_concurrent_cc: 10              # max open covered calls (covered, lower risk)
+    total_bp_utilization_target: 0.50  # never commit more than 50% of buying power total
+    buying_power_reserve_pct: 0.10     # always keep 10% of buying power unused
+  # Per-ticker criteria overrides — merged over criteria/cc_criteria. Tune names you know well:
+  per_ticker: {}             # e.g. {"NVDA": {"delta_max": 0.22}, "KO": {"dte_max": 21}}
+
+# --- Market-regime read (systemic vs idiosyncratic) ---
+macro:
+  enabled: true
+  symbols: ["SPY", "QQQ"]     # index-ETF proxies (VIX-proper isn't reachable via Alpaca yet)
+  risk_off_vol: 0.30          # SPY 20d realized vol >= this -> risk_off (VIX~30 proxy)
+  risk_off_drawdown: 0.10     # SPY 20d drawdown >= 10% -> risk_off
+  systemic_drawdown: 0.05     # market 20d dd >= 5% -> a stock's drop reads "systemic"
+  hard_gate: false            # true = pause ALL new entries while risk_off (default off: flags only)
+
+# --- AI trade-analyst (advisory) ---
+# Reviews each screened + sized CSP candidate before submission and records a structured verdict.
+# It can only flag/skip, NEVER widen risk. Needs ANTHROPIC_API_KEY (.env) + the `ai` extra.
+ai:
+  enabled: false             # turn on once ANTHROPIC_API_KEY is set
+  model: claude-opus-4-8
+  mode: advisory             # advisory = annotate only; veto = skip the trade on a "skip" verdict
+  max_candidates_per_scan: 3 # cap Claude calls per scan (cost control)
+  effort: medium             # low | medium | high | xhigh | max
+
+# --- Roll defense (tested short puts) ---
+# When a put is tested near expiry, roll it OUT (and down a strike) for a NET CREDIT instead of
+# realizing a loss or accepting a bad-basis assignment. Only rolls for a credit; else it leaves the
+# position to ride to assignment. Off by default.
+roll:
+  enabled: false
+  roll_dte: 3              # only consider rolling within this many days of expiry
+  roll_delta: 0.45         # ...and only when the put is tested (|delta| >= this)
+  target_dte_min: 7        # roll out to a new expiry in this window
+  target_dte_max: 14
+  min_net_credit: 0.0      # require net credit >= this (0 = never pay to roll)
+  max_target_delta: 0.35   # don't roll into an even more-tested put
+
+# --- Scheduled push reports (hands-off heartbeat) ---
+# For when you can't watch during the day: a daily digest (so 'no news' means 'all fine', not
+# 'it died') + a weekly performance rollup. Delivered via notify.provider (Pushover). Times ET.
+reporting:
+  enabled: true
+  daily_digest_hour: 16      # 24h ET; 16:15 = just after the close
+  daily_digest_minute: 15
+  weekly_report_weekday: 4   # 0=Mon .. 6=Sun; 4 = Friday
+
+notify:
+  provider: pushover         # none | ntfy | pushover  (set PUSHOVER_TOKEN/PUSHOVER_USER in .env)
+  ntfy_topic: ""
+
+tunnel:
+  provider: none             # none | cloudflared | ngrok
+  hostname: ""               # public host for one-tap approval links (e.g. agentic.example.com)
+
+web:
+  enabled: true             # run the FastAPI control/webhook API
+  host: 0.0.0.0
+  port: 8000
+  signal_ttl_seconds: 600   # how long a queued TradingView signal stays actionable
+
+# Rules evaluated per position each cycle. requires_approval is the hybrid-autonomy flag:
+#   false -> auto-execute (use only for safe, deterministic rules)
+#   true  -> push a notification and wait for one-tap approval
+rules:
+  - name: profit-target
+    rule_type: PROFIT_TARGET
+    enabled: true
+    requires_approval: false
+    params:
+      profit_pct: 0.5        # fixed: close once 50% of the credit is captured
+      # Trailing mode: let winners run past the arm level, then close on a pullback from the peak.
+      # trailing: true       # arm at profit_pct, then exit when profit falls trail_gap from its peak
+      # trail_gap: 0.20      # give-back from the high-water mark (0.20 = 20 points of captured %)
+  - name: stop-loss         # cap losers / avoid deep assignment (either trigger, whichever first)
+    rule_type: STOP_LOSS
+    enabled: true
+    requires_approval: false
+    params:
+      loss_mult: 2.0         # close when cost-to-close >= 2x credit (~ -100% of credit)
+      delta_stop: 0.5        # close when |delta| >= 0.50 (strike being breached)
+  - name: dte-close
+    rule_type: DTE
+    enabled: true
+    requires_approval: false
+    params:
+      dte_threshold: 2         # weeklies: close/let-expire near expiry (was 21 for monthlies)
+      action: close            # alert | close
+  - name: tv-signal
+    rule_type: SIGNAL
+    enabled: true
+    requires_approval: true
+    params:
+      match: underlying      # underlying | occ

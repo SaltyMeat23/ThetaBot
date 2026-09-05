@@ -1,0 +1,27 @@
+# Secrets & local state
+.env
+config.yaml
+# The whole data/ dir is runtime state (SQLite DB, OAuth tokens, paper book) — never commit any
+# of it, including renamed/backup variants like rh_oauth.json.old.
+data/
+
+# Local dev preview artifacts (machine-specific)
+dashboard_preview.png
+scripts/preview_dashboard.py
+backtest_*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
