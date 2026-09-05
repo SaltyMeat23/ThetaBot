@@ -29,7 +29,8 @@ It sells cash-secured puts on stocks you'd be happy to own, manages them to a pr
 7. [Step 3 — Install & deploy](#step-3--install--deploy)
 8. [Step 4 — First run, paper → live](#step-4--first-run-paper--live)
 9. [Configuration reference](#configuration-reference)
-10. [Operating the bot](#operating-the-bot)
+10. [Optional integrations (Alpaca / TradingView)](#optional-integrations-for-different-setups)
+11. [Operating the bot](#operating-the-bot)
 11. [Safety & risk controls](#safety--risk-controls)
 12. [Troubleshooting](#troubleshooting)
 13. [Disclaimer & license](#disclaimer--license)
@@ -190,8 +191,7 @@ On the VPS:
    entry:
      enabled: true
      watchlist: [F, SOFI, ...]     # names you are happy to own
-   market_data:
-     provider: robinhood            # this edition's default — no Alpaca needed
+   market_data: robinhood          # default: all data from your Robinhood login (no Alpaca)
    ```
 
    (Full options in the [Configuration reference](#configuration-reference).)
@@ -220,8 +220,7 @@ On the VPS:
 ```yaml
 mode: paper | live
 
-market_data:
-  provider: robinhood        # community edition default (alpaca also supported if you have keys)
+market_data: robinhood       # robinhood | alpaca | paper  (see "Optional integrations")
 
 entry:
   enabled: true
@@ -263,6 +262,54 @@ rules:                           # position management
 ```
 
 Tune the yield floor and delta band to your own risk tolerance. Higher `min_annualized_yield` = fewer, richer, higher-IV trades; lower = more, thinner ones.
+
+## Optional integrations (for different setups)
+
+**By default, ThetaBot needs nothing but your Robinhood login** — market data and trading both ride the same connection. But if you already pay for better data or extra signals, you can plug them in. Neither is required.
+
+### Option A — Alpaca for market data
+
+Robinhood's data is complete and works well for this slow strategy, but you can use **Alpaca** instead (e.g. you already have it, or want a separate data source):
+
+1. Create an account at **[alpaca.markets](https://alpaca.markets)** and generate API keys.
+2. **Real-time options data (OPRA) requires Alpaca's *paid* market-data subscription.** The free tier is delayed ("indicative") and is **not safe for live entry** — only use it for paper testing. Subscribe to their options/Algo data plan for live trading.
+3. Add the keys to `.env`:
+   ```ini
+   ALPACA_API_KEY=your_key
+   ALPACA_API_SECRET=your_secret
+   ```
+4. Switch the provider (and feed) in `config.yaml`:
+   ```yaml
+   market_data: alpaca
+   entry:
+     feed: opra        # real-time (paid). Use "indicative" only for paper/testing.
+   ```
+5. `docker compose up -d` to apply. Everything else is identical.
+
+### Option B — TradingView for extra trend signals
+
+ThetaBot can *optionally* gate entries on **ADX** (trend strength) and **Bollinger %B** (position in the band), fed from TradingView alerts. This is **pure enrichment — the bot runs fine without it**, and these gates are **off by default**.
+
+Requires a **TradingView plan that supports webhook alerts** (Pro+ or higher).
+
+1. Choose a webhook token and add it to `.env`:
+   ```ini
+   TRADINGVIEW_WEBHOOK_TOKEN=some_long_random_string
+   ```
+2. In TradingView, create alerts on your watchlist symbols with the **Webhook URL**:
+   ```
+   https://YOUR_HOST/webhook/tradingview?token=some_long_random_string
+   ```
+   and an alert message that posts the indicator values as JSON (the symbol plus its `adx` and `bb_percent_b`). The webhook handler at `POST /webhook/tradingview` ingests those into each name's context.
+3. Turn the gates on in `config.yaml`:
+   ```yaml
+   entry:
+     criteria:
+       min_adx: 20            # skip weak / choppy trends
+       min_bb_percent_b: 20   # skip price pinned to the lower band
+   ```
+
+If no fresh alert has arrived for a symbol, these gates simply **don't apply** (fail-open) — they never block a trade for lack of data. To turn them back off, remove the two lines (or set them to `null`).
 
 ## Operating the bot
 

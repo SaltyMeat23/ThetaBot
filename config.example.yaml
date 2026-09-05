@@ -5,12 +5,12 @@ mode: paper
 i_understand_live_trading: false
 
 # Which execution broker to use: paper | robinhood_mcp | robinstocks | alpaca
-broker: paper
+broker: robinhood_mcp    # this edition trades via Robinhood
 # If the chosen broker can't trade options, fall back to this one (or null to stay read-only).
-broker_fallback: null
+broker_fallback: paper
 
-# Market data provider: paper | alpaca
-market_data: paper
+# Market data provider: robinhood | alpaca | paper  (see README > Optional integrations)
+market_data: robinhood     # default: pull all data from the SAME Robinhood login (no Alpaca needed)
 
 # Simulated buying power the paper broker reports — set to your REAL account size so the
 # paper soak sizes positions realistically (default 100000 is a large sandbox balance).
@@ -46,7 +46,7 @@ robinhood:
 entry:
   enabled: false             # master switch; scanner does not run unless true
   watchlist: []              # tickers to scan, e.g. ["MSFT","NVDA","AMD"]
-  feed: indicative           # indicative (delayed, paper) | opra (real-time; REQUIRED for live)
+  feed: indicative           # ONLY used when market_data=alpaca (set 'opra' then). Ignored for robinhood.
   scan_interval_seconds: 300
   earnings_gate: true        # skip a name whose earnings fall within (dte_max + exclude_earnings_days)
                              # days — never hold a short put through earnings. Enforced only when an
@@ -138,6 +138,14 @@ web:
 # Rules evaluated per position each cycle. requires_approval is the hybrid-autonomy flag:
 #   false -> auto-execute (use only for safe, deterministic rules)
 #   true  -> push a notification and wait for one-tap approval
+# Loss circuit breaker: freezes NEW entries when realized losses pile up (never force-closes;
+# the monitor keeps managing open positions). Keys on realized P&L, not unrealized marks.
+risk:
+  loss_breaker_enabled: true
+  lookback_days: 7
+  max_realized_loss_pct: 0.10   # halt new entries if 7d realized P&L <= -10% of account (0 = off)
+  max_consecutive_losses: 4     # halt new entries after 4 straight realized losers (0 = off)
+
 rules:
   - name: profit-target
     rule_type: PROFIT_TARGET

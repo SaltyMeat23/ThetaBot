@@ -45,7 +45,15 @@ from .store.tv_indicators import TVIndicatorStore
 log = logging.getLogger("agentic.main")
 
 
-def build_market_data(settings: Settings) -> MarketDataProvider:
+def build_market_data(settings: Settings, broker=None) -> MarketDataProvider:
+    if settings.market_data == "robinhood":
+        # Reuse the trading broker's Robinhood MCP session for market data — one login, no Alpaca.
+        from .marketdata.robinhood_md import RobinhoodMarketData
+        if broker is not None and hasattr(broker, "_call_tool"):
+            return RobinhoodMarketData(broker)
+        log.warning("market_data=robinhood but the broker is not a Robinhood MCP broker; "
+                    "falling back to paper data.")
+        return PaperMarketData()
     if settings.market_data == "alpaca":
         return AlpacaMarketData(feed=settings.entry.feed)
     return PaperMarketData()
@@ -116,7 +124,7 @@ async def main_async(config_path: str | None = None) -> None:
     killswitch = KillSwitch(db, audit, auto_trip_threshold=settings.auto_trip_after_errors)
 
     broker = await build_broker(settings)
-    market_data = build_market_data(settings)
+    market_data = build_market_data(settings, broker)
     notifier = build_notifier(settings)
     rules_engine = RulesEngine.from_configs(settings.rules)
     executor = OrderExecutor(
