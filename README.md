@@ -29,8 +29,9 @@ It sells cash-secured puts on stocks you'd be happy to own, manages them to a pr
 7. [Step 3 — Install & deploy](#step-3--install--deploy)
 8. [Step 4 — First run, paper → live](#step-4--first-run-paper--live)
 9. [Configuration reference](#configuration-reference)
-10. [Optional integrations (Alpaca / TradingView)](#optional-integrations-for-different-setups)
-11. [Operating the bot](#operating-the-bot)
+10. [Accessing your dashboard securely](#accessing-your-dashboard-securely)
+11. [Optional integrations (Alpaca / TradingView)](#optional-integrations-for-different-setups)
+12. [Operating the bot](#operating-the-bot)
 11. [Safety & risk controls](#safety--risk-controls)
 12. [Troubleshooting](#troubleshooting)
 13. [Disclaimer & license](#disclaimer--license)
@@ -228,6 +229,36 @@ On the VPS:
 5. **Go live only when you're ready:** set `mode: live` in `config.yaml`, start with a **small** account and a **short** watchlist, then `docker compose up -d` to apply. The dashboard will show `live_armed: true`.
 
 ---
+
+## Accessing your dashboard securely
+
+The dashboard runs on your server at port **8000**. **You do not need a domain or a website.** Pick the access method that fits — simplest to most polished:
+
+### 1. Direct IP — quick look only
+`http://YOUR_VPS_IP:8000`. Instant, but it's plain HTTP (password unencrypted) and open to the internet. Fine for a first peek — **do not leave it exposed.** At minimum, firewall port 8000 to your own IP.
+
+### 2. SSH tunnel — recommended default (nothing exposed, free)
+Nothing to install, no open ports. From your computer:
+```bash
+ssh -L 8000:localhost:8000 root@YOUR_VPS_IP
+```
+Then open `http://localhost:8000` while that SSH session is running. The dashboard is never reachable from the public internet — the most private option, and it costs nothing.
+
+### 3. Cloudflare Tunnel — best for always-on access (HTTPS, no open ports) ✅ packaged
+A persistent, encrypted URL you can hit from anywhere (including your phone), with **no inbound ports open on your VPS**. It's built in — just enable it:
+1. At **dash.cloudflare.com → Zero Trust → Networks → Tunnels → Create a tunnel** (free).
+2. Add a **public hostname** (a subdomain on a domain you've added to Cloudflare) and route it to the service **`http://agentic:8000`**.
+3. Put the tunnel **token** in `.env`:  `CLOUDFLARE_TUNNEL_TOKEN=...`
+4. Start with the tunnel profile:
+   ```bash
+   docker compose --profile tunnel up -d
+   ```
+Now it's at `https://yourname.example.com`, port 8000 still closed to the world. For a real login wall, add a **Cloudflare Access** policy (email/Google) to that hostname — highly recommended.
+
+### 4. Your own domain + HTTPS (Caddy)
+Prefer to self-host HTTPS like a classic web app? Point a domain at the VPS and run Caddy in front for automatic Let's Encrypt certs. More moving parts than the tunnel; only if you specifically want it.
+
+**Bottom line:** most people should use the **SSH tunnel** for occasional checks, or a **Cloudflare Tunnel** for a secure always-on URL. A public website is optional.
 
 ## Configuration reference
 

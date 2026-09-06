@@ -20,3 +20,16 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+
+  # --- Optional: secure public access via a Cloudflare Tunnel (no open ports on your VPS) ---
+  # Setup: create a tunnel in the Cloudflare dashboard (free), route its public hostname to
+  #   http://agentic:8000, copy the tunnel token into .env as CLOUDFLARE_TUNNEL_TOKEN, then:
+  #   docker compose --profile tunnel up -d
+  # Add Cloudflare Access on that hostname for a real login layer. See README > Dashboard access.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    profiles: [tunnel]        # off by default; only starts with `--profile tunnel`
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - agentic
