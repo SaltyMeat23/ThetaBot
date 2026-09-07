@@ -24,7 +24,7 @@ from ..marketdata.quote import OptionContractQuote
 from ..store.audit import AuditStore
 from ..store.entry_decisions import EntryDecisionStore
 from ..store.trade_journal import TradeJournalStore
-from .risk_breaker import evaluate_risk_breaker
+from .risk_breaker import apply_sector_cap, evaluate_risk_breaker
 from .executor import OrderExecutor
 from .killswitch import KillSwitch
 from .market_hours import is_market_hours
@@ -240,6 +240,18 @@ class OpportunityScanner:
                 for e in csp_approved
             )
             csp_approved = []
+
+        # Correlation / sector concentration cap (opt-in): veto approved CSPs that would push one
+        # sector over its share of the account — so a many-name book can't become one correlated bet.
+        if self.settings.risk.max_pct_per_sector and csp_approved:
+            kept, capped = apply_sector_cap(
+                csp_approved, open_positions, self.settings.risk, account_value)
+            if capped:
+                log.info("Sector cap vetoed %d CSP entr(ies) for concentration.", len(capped))
+                for cand, reason in capped:
+                    skips.append({"symbol": cand.underlying, "reason": reason})
+                csp_rejected.extend(capped)
+            csp_approved = kept
 
         # CC pass — covered calls on shares held (strike floored at cost basis), per-ticker criteria.
         cc_cands: list[EntryCandidate] = []

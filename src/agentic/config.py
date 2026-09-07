@@ -227,6 +227,12 @@ class RiskConfig(BaseModel):
     lookback_days: int = 7                  # rolling window for the realized-loss sum
     max_realized_loss_pct: float = 0.10     # freeze new entries if window realized P&L <= -X% of account value (0 = off)
     max_consecutive_losses: int = 4         # freeze new entries after K straight realized losers (0 = off)
+    # Correlation / sector concentration cap. Group names into sectors/themes via sector_map, then cap
+    # how much of the account any ONE sector's cash-secured-put collateral can occupy — so a
+    # 'diversified' book of many names can't secretly be one AI/nuclear/crypto bet that all craters
+    # together. Opt-in: unmapped names are their own singleton sector (uncapped). None = off.
+    sector_map: dict[str, str] = Field(default_factory=dict)   # {"SMR": "nuclear", "CRWV": "ai-infra"}
+    max_pct_per_sector: float | None = None                    # e.g. 0.30 = no sector > 30% of account
 
 
 class Settings(BaseModel):
