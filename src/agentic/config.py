@@ -231,10 +231,10 @@ class Settings(BaseModel):
     broker: Literal["paper", "robinhood_mcp", "robinstocks", "alpaca"] = "paper"
     broker_fallback: Literal["paper", "robinhood_mcp", "robinstocks", "alpaca"] | None = None
     market_data: Literal["paper", "alpaca", "robinhood"] = "paper"
-    # "robinhood" (this edition's default in config.example.yaml): source all option + equity data
-    #   from the SAME Robinhood connection used to trade — one login, no extra data subscription.
-    # "alpaca": use Alpaca instead (real-time OPRA needs a paid Alpaca plan + ALPACA_API_* keys).
-    # "paper": simulated data for dry runs / tests.
+    # "robinhood": source all option + equity data from the SAME Robinhood connection used
+    #   to trade (one login, no Alpaca subscription). "alpaca": paid real-time OPRA.
+    #   "paper": simulated. Default stays "paper"/"alpaca" for prod; the community edition
+    #   ships "robinhood".
     # Simulated buying power the paper broker reports — set to your real account size so paper
     # sizing mirrors reality (default keeps the old large sandbox balance).
     paper_buying_power: float = 100_000.0

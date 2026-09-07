@@ -123,7 +123,7 @@ def test_capabilities_requires_account_number():
 
 @pytest.mark.asyncio
 async def test_get_buying_power_reads_nested_field_and_account_value(monkeypatch):
-    # Real get_portfolio shape verified 2026-07-17 against account 1234567890.
+    # Real get_portfolio shape verified 2026-07-17 against a live account.
     portfolio = {"data": {
         "total_value": "1500", "equity_value": "0", "options_value": "0", "cash": "1500",
         "pending_deposits": "0", "currency": "USD",
