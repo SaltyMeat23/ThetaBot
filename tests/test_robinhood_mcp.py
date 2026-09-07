@@ -361,3 +361,36 @@ async def test_reads_use_account_override(monkeypatch):
     await b.get_buying_power("OTHER2")
     assert ("get_equity_positions", "OTHER1") in seen
     assert ("get_portfolio", "OTHER2") in seen
+
+
+def test_get_index_quote_resolves_and_parses(monkeypatch):
+    import asyncio
+    b = _broker()
+    b._connected = True
+    b._tools = ["get_indexes", "get_index_quotes"]
+    calls = []
+
+    async def fake_call(name, args):
+        calls.append((name, args))
+        if name == "get_indexes":
+            return {"data": {"indexes": [{"symbol": "VIX", "id": "vix-id-123"}]}}
+        if name == "get_index_quotes":
+            assert args == {"instrument_ids": ["vix-id-123"]}
+            return {"data": {"quotes": [{"value": "18.75", "state": "active"}]}}
+        raise AssertionError(name)
+
+    monkeypatch.setattr(b, "_call_tool", fake_call)
+    val = asyncio.run(b.get_index_quote("VIX"))
+    assert val == 18.75
+    assert b._index_ids["VIX"] == "vix-id-123"          # id cached
+    # second call reuses the cached id (no second get_indexes)
+    asyncio.run(b.get_index_quote("VIX"))
+    assert [c[0] for c in calls].count("get_indexes") == 1
+
+
+def test_get_index_quote_none_when_tool_absent():
+    import asyncio
+    b = _broker()
+    b._connected = True
+    b._tools = []                                        # no index tools
+    assert asyncio.run(b.get_index_quote("VIX")) is None

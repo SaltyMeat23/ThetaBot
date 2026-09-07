@@ -74,3 +74,38 @@ def test_classify_neutral_when_stock_flat():
 
 def test_classify_unknown_when_no_stock_data():
     assert classify_move(None, MarketRegime(), CFG) == "unknown"
+
+
+# --- VIX regime signal -----------------------------------------------------------------------
+
+def _calm_bars():
+    # gently rising SPY -> low realized vol, no drawdown -> proxy says "calm"
+    return _bars([100 + i * 0.1 for i in range(220)])
+
+
+def test_vix_state_bands():
+    calm = _bars([100 + i * 0.1 for i in range(220)])
+    assert build_market_regime(calm, calm, CFG, vix=14.0).vix_state == "calm"
+    assert build_market_regime(calm, calm, CFG, vix=24.0).vix_state == "elevated"
+    assert build_market_regime(calm, calm, CFG, vix=33.0).vix_state == "stress"
+    assert build_market_regime(calm, calm, CFG, vix=None).vix_state is None
+
+
+def test_vix_stress_forces_risk_off_even_in_a_calm_tape():
+    calm = _calm_bars()
+    reg = build_market_regime(calm, calm, CFG, vix=33.0)   # tape calm, but VIX screaming
+    assert reg.label == "risk_off" and reg.risk_off is True
+    assert reg.vix == 33.0
+
+
+def test_vix_elevated_labels_elevated():
+    calm = _calm_bars()
+    reg = build_market_regime(calm, calm, CFG, vix=22.0)
+    assert reg.label == "elevated" and reg.risk_off is False
+
+
+def test_no_vix_falls_back_to_realized_vol_proxy():
+    # unchanged behavior when VIX is absent: a calm tape stays calm
+    calm = _calm_bars()
+    reg = build_market_regime(calm, calm, CFG, vix=None)
+    assert reg.vix is None and reg.label == "calm"

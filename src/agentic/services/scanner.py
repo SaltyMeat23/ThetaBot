@@ -105,7 +105,13 @@ class OpportunityScanner:
         except Exception as exc:  # noqa: BLE001 — regime is advisory; a data gap must not break the scan
             log.warning("Regime data fetch failed: %s", exc)
             return None
-        return build_market_regime(spy_bars or [], qqq_bars or [], cfg)
+        vix = None
+        try:
+            if hasattr(self.broker, "get_index_quote"):
+                vix = await self.broker.get_index_quote("VIX")
+        except Exception as exc:  # noqa: BLE001 — VIX is advisory
+            log.warning("VIX fetch failed: %s", exc)
+        return build_market_regime(spy_bars or [], qqq_bars or [], cfg, vix=vix)
 
     async def run(self) -> None:
         if not self.settings.entry.enabled:
@@ -607,6 +613,8 @@ class OpportunityScanner:
             context["mkt_spy_vol"] = reg.spy_realized_vol
             context["mkt_spy_drawdown_20d"] = reg.spy_drawdown_20d
             context["mkt_spy_above_sma200"] = reg.spy_above_sma200
+            context["mkt_vix"] = reg.vix
+            context["mkt_vix_state"] = reg.vix_state
         underlying_price = ctx.price if (ctx and ctx.price is not None) else None
         if underlying_price is None:
             try:

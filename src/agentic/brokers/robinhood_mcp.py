@@ -86,6 +86,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
         self._roles: dict[str, str] = {}     # logical role -> resolved tool name
         self._supports_options = False
         self._connected = False
+        self._index_ids: dict[str, str] = {}  # index symbol -> instrument id (cached)
         # OAuth: ONE shared provider + a lock that serializes MCP sessions. Robinhood rotates the
         # refresh token on every use, so two concurrent loops (monitor/reconcile/scanner) refreshing
         # at once invalidate each other's token and drop to a full interactive re-auth — the cause of
@@ -214,6 +215,41 @@ class RobinhoodMCPBroker(ExecutionBroker):
         if not role:
             raise RuntimeError("No option-order review/simulate tool resolved on this account.")
         return await self._call_tool(role, self._build_close_order_args(order))
+
+    async def get_index_quote(self, symbol: str) -> float | None:
+        """Current level of a market index (e.g. 'VIX'), or None if unavailable. Resolves the
+        symbol to its instrument id via get_indexes (cached), then get_index_quotes. Best-effort:
+        any failure or missing value returns None so the regime read degrades gracefully."""
+        if not self._connected or "get_index_quotes" not in self._tools:
+            return None
+        try:
+            iid = self._index_ids.get(symbol.upper())
+            if iid is None:
+                raw = await self._call_tool("get_indexes", {})
+                for rec in self._iter_records(raw):
+                    for idx in (rec.get("indexes") or []):
+                        sym, i = idx.get("symbol"), idx.get("id")
+                        if sym and i:
+                            self._index_ids[sym.upper()] = i
+                iid = self._index_ids.get(symbol.upper())
+            if not iid:
+                return None
+            raw = await self._call_tool("get_index_quotes", {"instrument_ids": [iid]})
+            for rec in self._iter_records(raw):
+                for q in (rec.get("quotes") or ([rec] if isinstance(rec, dict) else [])):
+                    if not isinstance(q, dict):
+                        continue
+                    for k in ("value", "last_value", "index_value", "last_trade_price", "price", "mark_price"):
+                        v = q.get(k)
+                        if v not in (None, ""):
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+            return None
+        except Exception as exc:  # noqa: BLE001 — index data is advisory; never break a scan
+            log.warning("get_index_quote(%s) failed: %s", symbol, exc)
+            return None
 
     async def get_buying_power(self, account_number: str | None = None) -> float:
         """Spendable cash/buying power for new CSPs, via the get_portfolio tool.

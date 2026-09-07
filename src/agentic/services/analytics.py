@@ -59,6 +59,8 @@ _DIMENSIONS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "iv_rv_ratio": lambda r: _band(_ctx(r).get("iv_rv_ratio"), [0.9, 1.1, 1.4],
                                    ["<0.9", "0.9-1.1", "1.1-1.4", "1.4+"]),
     "mkt_regime": lambda r: _ctx(r).get("mkt_regime"),   # market regime at entry (calm/elevated/risk_off)
+    "vix_state": lambda r: _ctx(r).get("mkt_vix_state"),                 # VIX regime at entry
+    "vix": lambda r: _band(_ctx(r).get("mkt_vix"), [15, 20, 30], ["<15", "15-20", "20-30", "30+"]),
     "mfe_pct": lambda r: _band(_ctx(r).get("mfe_pct"), [0.25, 0.5, 0.75],
                                ["<25%", "25-50%", "50-75%", "75%+"]),   # best profit the trade reached
     "mae_pct": lambda r: _band(_ctx(r).get("mae_pct"), [-0.5, -0.25, 0.0],

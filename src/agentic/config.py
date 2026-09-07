@@ -127,6 +127,11 @@ class RegimeConfig(BaseModel):
     lookback_days: int = 220               # daily bars to pull (>=200 for the 200-SMA)
     elevated_vol: float = 0.20             # SPY annualized realized vol >= -> "elevated" (VIX~20)
     risk_off_vol: float = 0.30             # >= -> "risk_off" (VIX~30)
+    # Live VIX thresholds (used when a VIX feed is available; VIX-proper comes from the Robinhood
+    # market_data provider via get_index_quotes). VIX-stress flips the regime to risk_off, so the
+    # existing hard_gate then stands the scanner down. Falls back to the realized-vol proxy if no VIX.
+    vix_elevated_level: float = 20.0       # VIX >= this -> 'elevated'
+    vix_stress_level: float = 30.0         # VIX >= this -> 'stress' (risk_off)
     elevated_drawdown: float = 0.05        # SPY 20d drawdown >= 5% -> "elevated"
     risk_off_drawdown: float = 0.10        # >= 10% -> "risk_off"
     systemic_drawdown: float = 0.05        # market 20d dd >= 5% -> a stock's drop reads "systemic"

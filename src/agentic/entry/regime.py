@@ -36,7 +36,9 @@ class MarketRegime:
     spy_above_sma200: bool | None = None
     qqq_above_sma200: bool | None = None
     spy_drawdown_20d: float | None = None
-    spy_realized_vol: float | None = None   # annualized fraction — the VIX proxy (v1)
+    spy_realized_vol: float | None = None   # annualized fraction — the realized-vol fear proxy
+    vix: float | None = None                # live CBOE VIX level (implied vol, forward-looking)
+    vix_state: str | None = None            # calm | elevated | stress (from VIX thresholds)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -50,9 +52,24 @@ def _above_sma200(closes: list[float]) -> bool | None:
     return price > s200
 
 
+def _vix_state(vix: float | None, cfg: RegimeConfig) -> str | None:
+    """VIX level -> regime state. VIX is the market's forward-looking implied vol (the 'fear
+    gauge'); when high, option premium is a trap more often than a gift, so we stand down."""
+    if vix is None:
+        return None
+    if vix >= cfg.vix_stress_level:
+        return "stress"
+    if vix >= cfg.vix_elevated_level:
+        return "elevated"
+    return "calm"
+
+
 def _label(reg: "MarketRegime", cfg: RegimeConfig) -> tuple[str, bool | None]:
-    rv, dd = reg.spy_realized_vol, reg.spy_drawdown_20d
-    if rv is None and dd is None:
+    rv, dd, vs = reg.spy_realized_vol, reg.spy_drawdown_20d, reg.vix_state
+    # Live VIX is the best signal when present: a VIX-stress read alone flips the market to risk_off.
+    if vs == "stress":
+        return "risk_off", True
+    if rv is None and dd is None and vs is None:
         return "unknown", None
     risk_off = (
         (rv is not None and rv >= cfg.risk_off_vol)
@@ -61,14 +78,16 @@ def _label(reg: "MarketRegime", cfg: RegimeConfig) -> tuple[str, bool | None]:
     if risk_off:
         return "risk_off", True
     elevated = (
-        (rv is not None and rv >= cfg.elevated_vol)
+        vs == "elevated"
+        or (rv is not None and rv >= cfg.elevated_vol)
         or (dd is not None and dd <= -cfg.elevated_drawdown)
     )
     return ("elevated" if elevated else "calm"), False
 
 
 def build_market_regime(
-    spy_bars: list[dict], qqq_bars: list[dict], cfg: RegimeConfig
+    spy_bars: list[dict], qqq_bars: list[dict], cfg: RegimeConfig,
+    vix: float | None = None,
 ) -> MarketRegime:
     """Build the market regime from SPY + QQQ daily bars ([{date,o,h,l,c,v}], oldest->newest)."""
     spy_closes = [b["c"] for b in spy_bars if b.get("c") is not None]
@@ -81,6 +100,8 @@ def build_market_regime(
         qqq_above_sma200=_above_sma200(qqq_closes),
         spy_drawdown_20d=drawdown(spy_closes, 20),
         spy_realized_vol=indicators.realized_vol(spy_closes, 20),
+        vix=vix,
+        vix_state=_vix_state(vix, cfg),
     )
     reg.label, reg.risk_off = _label(reg, cfg)
     return reg
