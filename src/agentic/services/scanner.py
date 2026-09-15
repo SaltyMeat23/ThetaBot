@@ -31,8 +31,10 @@ from .market_hours import is_market_hours
 from ..entry.context import UnderlyingContext, build_context, passes_underlying_gates
 from ..entry.regime import MarketRegime, build_market_regime, classify_move
 from ..entry.risk import RiskSizer
-from ..entry.screener import EntryCandidate, screen_candidates
+from ..entry.screener import EntryCandidate, passes_candidate_gates, screen_candidates
 from ..marketdata.earnings import NullEarningsProvider, earnings_blackout
+from ..marketdata.company_data import NullCompanyDataProvider
+from ..scoring.quality import quality_breakdown
 
 log = logging.getLogger("agentic.scanner")
 
@@ -44,6 +46,20 @@ def iv_rank_sort_key(candidate, context_by_underlying) -> tuple[float, float]:
     ctx = context_by_underlying.get(candidate.underlying)
     ivr = ctx.iv_rank if (ctx is not None and ctx.iv_rank is not None) else 50.0
     return (float(ivr), float(candidate.theta_efficiency))
+
+
+def quality_sort_key(candidate, context_by_underlying, prefer_iv_rank: bool = False) -> tuple:
+    """Ranking key for ``prefer_quality``: prefer higher-quality names, but only in COARSE tiers
+    (rounded to ~10 points) so premium richness still orders names of similar quality. Unknown
+    quality maps to 50 (neutral). Secondary key is IV rank (if ``prefer_iv_rank``) then
+    theta-efficiency, else theta-efficiency. Sort descending on this tuple."""
+    ctx = context_by_underlying.get(candidate.underlying)
+    q = ctx.quality_score if (ctx is not None and ctx.quality_score is not None) else 50.0
+    q_tier = round(q / 10.0)
+    if prefer_iv_rank:
+        ivr = ctx.iv_rank if (ctx is not None and ctx.iv_rank is not None) else 50.0
+        return (float(q_tier), float(ivr), float(candidate.theta_efficiency))
+    return (float(q_tier), float(candidate.theta_efficiency), 0.0)
 
 
 class OpportunityScanner:
@@ -61,6 +77,7 @@ class OpportunityScanner:
         tv_indicators=None,         # store.tv_indicators.TVIndicatorStore | None
         ai_reviews=None,            # store.ai_reviews.AIReviewStore | None
         earnings=None,              # marketdata.earnings.EarningsProvider | None
+        company_data=None,          # marketdata.company_data.CompanyDataProvider | None
         entry_candidates=None,      # store.entry_candidates.EntryCandidateStore | None
         news_provider=None,         # marketdata.news.NewsProvider | None (pull)
         news=None,                  # store.news.NewsStore | None
@@ -78,6 +95,7 @@ class OpportunityScanner:
         self.ai_reviews = ai_reviews
         self.entry_candidates = entry_candidates
         self.earnings = earnings or NullEarningsProvider()
+        self.company_data = company_data or NullCompanyDataProvider()
         self.news_provider = news_provider
         self.news = news
         self.sizer = RiskSizer(settings.entry.sizing)
@@ -87,6 +105,7 @@ class OpportunityScanner:
         self.last_cc_candidates: list[EntryCandidate] = []    # covered-call candidates
         self.last_holdings: list = []                         # EquityHolding snapshot
         self.last_context: dict[str, UnderlyingContext] = {}  # per-symbol technicals/IV-rank
+        self.last_quality: dict[str, dict] = {}               # per-symbol company-quality readout (informational)
         self.last_skips: list[dict] = []                      # names skipped by underlying gates
         self.last_error: str | None = None
         self.last_scan_at = None
@@ -183,6 +202,7 @@ class OpportunityScanner:
             return chain_cache[symbol]
 
         context_by_underlying: dict[str, UnderlyingContext] = {}
+        self.last_quality = {}  # rebuilt this scan by _overlay_quality (informational readout)
         skips: list[dict] = []
 
         # CSP pass — watchlist puts, per-ticker criteria + underlying gates (entry intelligence).
@@ -214,8 +234,24 @@ class OpportunityScanner:
                     skips.append({"symbol": underlying, "reason":
                                   f"{len(cands) - len(kept)} strike(s) above support {ceiling:.2f}"})
                 cands = kept
+            # Context-aware cushion (expected-move) + variance-risk-premium gates (both opt-in).
+            passed, gate_reason = [], None
+            for c in cands:
+                r = passes_candidate_gates(c, ctx, crit)
+                if r is None:
+                    passed.append(c)
+                elif gate_reason is None:
+                    gate_reason = r
+            if len(passed) < len(cands):
+                skips.append({"symbol": underlying, "reason":
+                              f"{len(cands) - len(passed)} strike(s) failed cushion/VRP: {gate_reason}"})
+            cands = passed
             csp_cands.extend(cands)
-        if cfg.prefer_iv_rank:
+        if cfg.prefer_quality:
+            csp_cands.sort(
+                key=lambda c: quality_sort_key(c, context_by_underlying, cfg.prefer_iv_rank),
+                reverse=True)
+        elif cfg.prefer_iv_rank:
             csp_cands.sort(key=lambda c: iv_rank_sort_key(c, context_by_underlying), reverse=True)
         else:
             csp_cands.sort(key=lambda x: x.theta_efficiency, reverse=True)  # decay-per-collateral
@@ -678,7 +714,43 @@ class OpportunityScanner:
             [iv for _d, iv in self.trade_journal.iv_history(symbol)]
             if self.trade_journal is not None else []
         )
-        return build_context(symbol, bars, self._atm_iv(chain), iv_hist, criteria)
+        ctx = build_context(symbol, bars, self._atm_iv(chain), iv_hist, criteria)
+        await self._overlay_quality(symbol, ctx, bars)
+        return ctx
+
+    async def _overlay_quality(self, symbol: str, ctx: UnderlyingContext, bars: list[dict]) -> None:
+        """Overlay the company quality/growth score onto the context (best-effort, fail-open).
+
+        Reuses the bars already fetched for technicals (no extra market-data call) and the
+        company-data provider (cached per name per day). Any failure leaves quality_score None —
+        a name with no company data is treated as neutral, never penalized."""
+        try:
+            profile = await self.company_data.profile(symbol)
+        except Exception as exc:  # noqa: BLE001 — quality is advisory; never break the scan
+            log.warning("company-data lookup failed for %s: %s", symbol, exc)
+            return
+        if profile is None:
+            return
+        try:
+            bd = quality_breakdown(profile, bars, ctx.above_sma200)
+            ctx.quality_score = bd["score"]
+            # Informational snapshot for the dashboard's Company Quality panel (NOT a trade input):
+            # the score, its sub-scores, and the raw metrics behind them ("is this name profitable?").
+            self.last_quality[symbol.upper()] = {
+                "score": bd["score"],
+                "sector": profile.sector,
+                "market_cap": profile.market_cap,
+                "gross_margin": profile.gross_margin,
+                "net_margin": profile.net_margin,
+                "revenue_growth": profile.revenue_growth,
+                "fcf_margin": profile.fcf_margin,
+                "gross_profitability": profile.gross_profitability,
+                "insider_net_buys_90d": profile.insider_net_buys_90d,
+                "subscores": {k: bd.get(k) for k in
+                              ("profitability", "cash", "growth", "momentum", "insider_bonus")},
+            }
+        except Exception as exc:  # noqa: BLE001 — scoring must never break the scan
+            log.warning("quality score failed for %s: %s", symbol, exc)
 
     def stop(self) -> None:
         self._stop.set()

@@ -60,7 +60,7 @@ It is deliberately a **slow, patient** strategy: 7–14 day expirations, held fo
 | **Executor** | Places and confirms orders through Robinhood; never leaves an order in an unknown state. |
 | **Reconcile** | Keeps the bot's ledger in sync with what Robinhood actually reports (assignments, expiries, fills). |
 | **Risk** | Position/sizing caps, entry gates, a **loss circuit breaker**, and an instant kill switch. |
-| **Dashboard** | A read-only web page (password-protected) showing health, positions, P&L, and the "why" behind every decision. |
+| **Dashboard** | A password-protected web page: health, positions, weekly **and** all-time P&L, the "why" behind every decision, an on-demand **Weekly tactical brief**, and a **Tuning** tab to change config live from your phone. |
 
 All of it runs as **one small Docker container** that keeps its state (a local SQLite database + your login token) on a persistent volume. Market data — option chains, quotes, greeks, IV, open interest, and daily price bars — is pulled from **Robinhood's own connection** (`market_data.provider: robinhood`), so there are **no separate data subscriptions**.
 
@@ -286,6 +286,10 @@ entry:
     max_spread_pct: 0.10
     max_pct_below_sma200: 0.20   # skip broken downtrends
     require_strike_below_support: true
+    min_strike_expected_moves: null # OFF. Require the strike >= N option-implied expected-moves OTM
+                                    # (scales the cushion to each name's own volatility).
+    min_iv_rv_ratio: null           # OFF. Only sell when IV beats the name's realized vol by this
+                                    # ratio (e.g. 1.1) -- the variance-risk-premium edge.
   cc_criteria:                   # the covered-call screen (post-assignment)
     delta_min: 0.20
     delta_max: 0.30
@@ -296,6 +300,11 @@ entry:
     total_bp_utilization_target: 0.80
     buying_power_reserve_pct: 0.15
     max_pct_of_oi: 0.10          # never take >10% of a strike's open interest
+    max_pct_per_underlying: null # OFF by default. Set (e.g. 0.15) to allow MORE THAN ONE CSP per
+                                 # name -- laddered strikes/expiries up to this % of account in that
+                                 # name; still no averaging-in over later days. null = one per name.
+  per_ticker:                    # optional: override any `criteria` field for one name (merged over it)
+    # NVDA: { delta_max: 0.22, min_iv_rank: 40 }
 
 risk:                            # loss circuit breaker (freezes NEW entries; never force-closes)
   loss_breaker_enabled: true
@@ -360,7 +369,11 @@ If no fresh alert has arrived for a symbol, these gates simply **don't apply** (
 
 ## Operating the bot
 
-- **Dashboard** (`/`): health, open positions, realized/unrealized P&L, win rate, and the reason behind each close.
+- **Dashboard** (`/`) -- tabbed and mobile-friendly:
+  - **Overview:** health, open positions, realized/unrealized P&L (this week **and** all-time), win rate, and the reason behind each close.
+  - **Brief:** an on-demand **Weekly tactical brief** (`/api/brief`) -- market backdrop, this week's catalysts, per-name expected-move **cushion** (strike distance in option-implied moves), earnings-inside-the-contract flags, open-position **management** (roll window / moneyness), and **assignment capacity** (collateral if every short put were assigned vs. buying power). Descriptive only -- not advice.
+  - **Tuning:** change config **live from your phone** -- no SSH, no restart. Multi-CSP cap, the entry gates, the delta band, and per-ticker overrides, each schema-validated and persisted to a writable overlay (safety-critical keys stay locked).
+- **Open interest:** `GET /api/option-oi?symbol=SMR` returns the full call+put chain with OI, volume, IV and greeks (Robinhood-sourced; Alpaca's snapshots carry no OI).
 - **Pause / resume:** the kill switch halts *all* new orders instantly; use it any time you want to stop trading without touching positions.
 - **Loss circuit breaker:** trips automatically on a losing streak (see below) and shows in `/api/ops` — it freezes *new* entries but keeps managing what's open.
 - **Logs:** `docker compose logs -f` on the VPS.
@@ -373,7 +386,7 @@ The bot is built to *survive*, not to gamble:
 
 - **Only sells names you list** — you curate the universe of what it can be assigned.
 - **Position + concentration caps** so no single trade dominates.
-- **Entry gates** — skips earnings, broken downtrends, illiquid contracts.
+- **Entry gates** — skips earnings, broken downtrends, illiquid contracts, and (opt-in) thin cushion or thin variance-risk-premium (the expected-move and IV/realized gates).
 - **Loss circuit breaker** — freezes new entries after a bad realized run (default: −10% of account in 7 days, or 4 straight losers). It **never force-liquidates** — it stops digging, it doesn't panic-sell.
 - **Instant kill switch** — halts on broker errors or on your command.
 - **No hidden leverage** — cash-secured puts are fully collateralized.

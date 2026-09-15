@@ -15,6 +15,7 @@ from .logging_setup import setup_logging
 from .marketdata.alpaca_md import AlpacaMarketData
 from .marketdata.base import MarketDataProvider, PaperMarketData
 from .marketdata.earnings import build_earnings_provider
+from .marketdata.company_data import build_company_data
 from .marketdata.news import build_news_provider
 from .notify.factory import build_notifier
 from .rules.engine import RulesEngine
@@ -135,6 +136,7 @@ async def main_async(config_path: str | None = None) -> None:
         settings, broker, market_data, entry_decisions, executor, audit, killswitch,
         trade_journal=trade_journal, ai_reviewer=ai_reviewer, tv_indicators=tv_indicators,
         ai_reviews=ai_reviews, earnings=build_earnings_provider(settings, broker),
+        company_data=build_company_data(settings, broker),
         entry_candidates=entry_candidates,
         news_provider=build_news_provider(settings), news=news,
     )

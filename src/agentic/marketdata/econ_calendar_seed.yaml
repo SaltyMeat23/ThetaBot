@@ -1,0 +1,33 @@
+# Curated economic-event calendar (SEED) for the weekly tactical brief.
+#
+# !!! MAINTAIN THIS !!!  These are a CURATED STATIC schedule, not a live feed. Replace/extend with
+# the OFFICIAL dates each year:
+#   - FOMC decisions:      federalreserve.gov  (meeting calendar, published ~1 year ahead)
+#   - CPI / PPI / NFP / retail sales:  bls.gov + census.gov release schedules
+# To override on the VPS without a redeploy, create data/econ_calendar.yaml (gitignored) with the
+# same shape; it takes precedence over this committed seed.
+#
+# Dates below VERIFIED 2026-09-13 against the official sources (FOMC decision day = 2nd day of the
+# meeting; BLS/Census release dates as published, reflecting the 2025/2026 appropriations-lapse
+# revisions). Events are labeled by their DATA month; the release lands the following month.
+# Coverage runs through mid-Dec 2026 — refresh with the 2027 schedules before year-end.
+#
+# Shape: a list of {date: YYYY-MM-DD, event: "...", importance: high|medium|low}
+
+events:
+  - {date: 2026-09-16, event: "FOMC rate decision + press conference", importance: high}
+  - {date: 2026-09-16, event: "Retail sales (Aug)", importance: medium}
+  - {date: 2026-10-02, event: "Nonfarm payrolls (Sept)", importance: high}
+  - {date: 2026-10-14, event: "CPI (Sept)", importance: high}
+  - {date: 2026-10-15, event: "PPI (Sept)", importance: medium}
+  - {date: 2026-10-15, event: "Retail sales (Sept)", importance: medium}
+  - {date: 2026-10-28, event: "FOMC rate decision + press conference", importance: high}
+  - {date: 2026-11-06, event: "Nonfarm payrolls (Oct)", importance: high}
+  - {date: 2026-11-10, event: "CPI (Oct)", importance: high}
+  - {date: 2026-11-13, event: "PPI (Oct)", importance: medium}
+  - {date: 2026-11-17, event: "Retail sales (Oct)", importance: medium}
+  - {date: 2026-12-04, event: "Nonfarm payrolls (Nov)", importance: high}
+  - {date: 2026-12-09, event: "FOMC rate decision + Summary of Economic Projections", importance: high}
+  - {date: 2026-12-10, event: "CPI (Nov)", importance: high}
+  - {date: 2026-12-15, event: "PPI (Nov)", importance: medium}
+  - {date: 2026-12-16, event: "Retail sales (Nov)", importance: medium}

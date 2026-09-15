@@ -62,6 +62,23 @@ def evaluate_risk_breaker(journal, cfg, account_value: float | None, now: dateti
     return state
 
 
+def sector_exposure(open_positions, sector_map) -> dict[str, float]:
+    """Short-put collateral (strike*100*qty) grouped by sector. Shared by apply_sector_cap and the
+    dashboard concentration read so the two never drift. Assumes the caller passes OPEN positions."""
+    smap = sector_map or {}
+
+    def sector(sym: str) -> str:
+        return smap.get(sym.upper()) or smap.get(sym) or sym.upper()
+
+    exp: dict[str, float] = {}
+    for p in open_positions:
+        ot = getattr(p, "option_type", None)
+        if str(getattr(ot, "value", ot)).lower() == "put":
+            coll = (getattr(p, "strike", 0) or 0) * 100 * (getattr(p, "quantity", 0) or 0)
+            exp[sector(p.underlying)] = exp.get(sector(p.underlying), 0.0) + coll
+    return exp
+
+
 def apply_sector_cap(approved, open_positions, cfg, account_value):
     """Drop approved CSP entries that would push a sector over ``max_pct_per_sector`` of account value.
 
@@ -82,12 +99,7 @@ def apply_sector_cap(approved, open_positions, cfg, account_value):
     def sector(sym: str) -> str:
         return smap.get(sym.upper()) or smap.get(sym) or sym.upper()
 
-    exposure: dict[str, float] = {}
-    for p in open_positions:
-        ot = getattr(p, "option_type", None)
-        if str(getattr(ot, "value", ot)).lower() == "put":
-            coll = (p.strike or 0) * 100 * (p.quantity or 0)
-            exposure[sector(p.underlying)] = exposure.get(sector(p.underlying), 0.0) + coll
+    exposure = sector_exposure(open_positions, smap)
 
     limit = cap * account_value
     kept, skipped = [], []

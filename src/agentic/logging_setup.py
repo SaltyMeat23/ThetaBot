@@ -7,6 +7,12 @@ import sys
 
 def setup_logging(level: str = "INFO") -> None:
     """Configure root logging once, with a concise console format."""
+    # Silence the MCP streamable-http notification-stream churn: the client reconnects that GET
+    # stream (+ logs "Session termination failed: 400") every ~5s against the Robinhood agentic
+    # server. This bot uses request/response tool calls, not the notification stream, so it's
+    # harmless — but it floods the logs and buries real errors. Keep ERROR so genuine MCP failures
+    # still surface. Set before the already-configured guard so it always applies.
+    logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
     root = logging.getLogger()
     if root.handlers:  # already configured
         root.setLevel(level)

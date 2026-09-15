@@ -23,6 +23,7 @@ from datetime import date
 from ..config import EntryCriteria
 from ..domain.models import utcnow
 from ..marketdata.quote import OptionContractQuote
+from ..services.brief_metrics import expected_move
 
 
 @dataclass
@@ -46,6 +47,29 @@ class EntryCandidate:
     theta: float | None = None          # per-share daily decay we collect (short premium)
     gamma: float | None = None          # assignment-risk acceleration
     theta_efficiency: float = 0.0        # daily decay per $ of collateral — the ranking key
+
+
+def passes_candidate_gates(cand: "EntryCandidate", ctx, crit: EntryCriteria) -> str | None:
+    """Context-aware per-candidate gates that need the underlying's vol profile, so they can't live
+    in screen_candidates (which sees only the chain). Both opt-in; fail-open on missing data. Returns
+    None on pass (or when a gate's data is unavailable), else a short reason.
+      * min_iv_rv_ratio          — variance-risk-premium floor: sold IV vs the name's realized vol.
+      * min_strike_expected_moves — require the strike to sit >= N option-implied expected-moves OUT
+        of the money, scaling the cushion to the name's own volatility (the BULL lesson).
+    """
+    rv = getattr(ctx, "realized_vol", None)
+    price = getattr(ctx, "price", None)
+    if crit.min_iv_rv_ratio is not None and cand.iv is not None and rv:
+        ratio = cand.iv / rv
+        if ratio < crit.min_iv_rv_ratio:
+            return f"iv/rv {ratio:.2f} < {crit.min_iv_rv_ratio} (thin variance premium)"
+    if crit.min_strike_expected_moves is not None:
+        em = expected_move(price, cand.iv, cand.dte)
+        if em and price is not None:
+            strike_em = (price - cand.strike) / em
+            if strike_em < crit.min_strike_expected_moves:
+                return f"cushion {strike_em:.2f}x EM < {crit.min_strike_expected_moves}x (thin)"
+    return None
 
 
 def _passes_liquidity(c: OptionContractQuote, crit: EntryCriteria) -> bool:

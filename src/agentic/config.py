@@ -60,12 +60,27 @@ class EntryCriteria(BaseModel):
     # TradingView-fed gates (opt-in; None = don't gate; fail-open when no fresh adx/bb%b alert).
     min_adx: float | None = None           # skip if daily ADX below this (weak/choppy trend, ~20-25 typical)
     min_bb_percent_b: float | None = None  # skip if Bollinger %B below this (price pinned to the lower band)
+    # Company quality/growth gate (opt-in; None = don't gate; fail-open when no company data / score).
+    # Skip a name whose blended quality_growth_score (0-100) is below this — a data-backed "would I
+    # actually own this" filter, since a CSP that's assigned means owning the stock. Requires
+    # entry.quality_scoring on (so a company-data provider is wired). See scoring/quality.py.
+    min_quality_score: float | None = None
     iv_rank_min_history_days: int = 60     # IV-Rank stays None until this many daily IVs exist
     # Strike-below-support gate (opt-in): only sell a put whose strike sits at/below the latest
     # TradingView support level, so support cushions a decline before assignment is threatened.
     # Fails open — when no fresh support snapshot exists for the name, the gate simply doesn't apply.
     require_strike_below_support: bool = False
     support_buffer_pct: float = 0.0        # require strike this fraction BELOW support (0 = at/below)
+    # Expected-move cushion gate (opt-in): require the short-put strike to sit at least this many
+    # option-implied 1-sigma moves (expected_move = price*iv*sqrt(dte/365)) OUT of the money. Scales
+    # the cushion to each name's OWN volatility, so a jumpy name needs a further-OTM strike than a calm
+    # one at the same delta (the BULL lesson). None = off; fail-open when price/iv/dte are unknown.
+    min_strike_expected_moves: float | None = None
+    # Variance-risk-premium floor (opt-in): require the sold put's IV to exceed the name's realized vol
+    # by at least this ratio (iv/rv) — sell premium only when implied is richer than realized, the
+    # actual edge. e.g. 1.1 = IV must be >= 10% above realized. None = off; fail-open when realized vol
+    # or the candidate IV is unknown.
+    min_iv_rv_ratio: float | None = None
 
 
 class EntrySizing(BaseModel):
@@ -83,6 +98,15 @@ class EntrySizing(BaseModel):
     # Liquidity cap (opt-in): never take more than this fraction of a strike's open interest.
     # Fail-open when OI is unknown. Protects large accounts from over-filling thin options. None = off.
     max_pct_of_oi: float | None = None
+    # Multi-CSP per underlying (opt-in). When set, a name may hold MORE THAN ONE CSP — laddered
+    # strikes/expiries and/or more contracts of one strike — accumulated in a single scan up to this
+    # fraction of account value in that name's total short-put collateral (e.g. 0.15 = 15%). This
+    # REPLACES the default "one CSP per underlying" rule and the diversified/backstop per-name cap for
+    # sizing (so the deliberate per-name ceiling can exceed max_position_size_pct). Names already held
+    # from a PRIOR scan are still not added to (no averaging-in over days). Sector cap, total-BP
+    # utilization, reserve, liquidity, and max_concurrent_positions all still apply as outer bounds.
+    # None (default) = legacy one-CSP-per-underlying behavior, unchanged.
+    max_pct_per_underlying: float | None = None
 
 
 class EntryConfig(BaseModel):
@@ -100,6 +124,23 @@ class EntryConfig(BaseModel):
     # names with unknown IV rank (too little history) are treated as neutral, never penalized. Off by
     # default (pure theta-efficiency ranking).
     prefer_iv_rank: bool = False
+    # Company quality/growth scoring: fetch per-name fundamentals (via the connected RH broker) and
+    # compute a 0-100 quality_growth_score. This is INFORMATIONAL by default — it's logged and shown
+    # in the dashboard's Company Quality panel so you can eyeball "is this name actually profitable /
+    # decent", and it does NOT affect which trades are placed. It only touches trade decisions if you
+    # separately opt in via `criteria.min_quality_score` (a gate, default off) or `prefer_quality` (a
+    # ranking tilt, default off). Off by default; fail-open. See scoring/quality.py.
+    quality_scoring: bool = False
+    # Phase B: enrich the quality score with free SEC EDGAR data (FCF margin + Novy-Marx gross
+    # profitability, which arm the cash-burn junk screen, plus insider open-market buys / Form 4).
+    # Requires quality_scoring on AND edgar_user_agent set. Off by default; fail-open.
+    quality_use_edgar: bool = False
+    # SEC requires a descriptive User-Agent with a contact for EDGAR access (a bot-ish UA gets 403).
+    # Set to e.g. "YourName you@example.com". Unset -> EDGAR enrichment is skipped (fail-open).
+    edgar_user_agent: str | None = None
+    # When quality_scoring is on, blend the quality score into candidate ranking (higher quality wins
+    # among comparable premium). Independent of prefer_iv_rank; both can be on.
+    prefer_quality: bool = False
     # Soft weekly over-trading throttle: once THIS week's collected CSP premium reaches this fraction
     # of account value, further auto-entries are held for one-tap approval instead of firing
     # automatically (not a hard cap). 0 = off. e.g. 0.02 = "auto-trade until ~2%/week, then ask me".

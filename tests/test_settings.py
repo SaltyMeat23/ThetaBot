@@ -37,6 +37,31 @@ def test_hot_apply_reaches_live_sizer(tmp_path):
     assert sizer.sizing.max_position_size_pct == 0.25
 
 
+def test_hot_apply_new_tuning_knobs(tmp_path):
+    """The Tuning-panel levers round-trip through /api/config: multi-CSP cap, the entry gates, and
+    a per-ticker override — validated, hot-applied in place, and persisted."""
+    settings = Settings(broker="paper", market_data="paper")
+    sizer = RiskSizer(settings.entry.sizing)
+    ov = tmp_path / "overlay.yaml"
+
+    apply_patch(settings, {"entry": {
+        "sizing": {"max_pct_per_underlying": 0.15},
+        "criteria": {"min_strike_expected_moves": 1.0, "min_iv_rv_ratio": 1.1},
+        "per_ticker": {"BULL": {"delta_max": 0.18, "min_iv_rank": 40}},
+    }}, overlay_path=ov)
+
+    assert sizer.sizing.max_pct_per_underlying == 0.15          # reached the live sizer by reference
+    assert settings.entry.criteria.min_strike_expected_moves == 1.0
+    assert settings.entry.criteria.min_iv_rv_ratio == 1.1
+    assert settings.entry.per_ticker["BULL"]["delta_max"] == 0.18
+    saved = load_overlay(ov)
+    assert saved["entry"]["sizing"]["max_pct_per_underlying"] == 0.15   # persisted across restarts
+
+    # And turning the cap back off (null) is accepted.
+    apply_patch(settings, {"entry": {"sizing": {"max_pct_per_underlying": None}}}, overlay_path=ov)
+    assert settings.entry.sizing.max_pct_per_underlying is None
+
+
 def test_edit_persists_and_merges_overlay(tmp_path):
     settings = Settings(broker="paper", market_data="paper")
     ov = tmp_path / "overlay.yaml"

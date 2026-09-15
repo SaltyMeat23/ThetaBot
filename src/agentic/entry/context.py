@@ -26,6 +26,9 @@ class UnderlyingContext:
     adx: float | None = None               # daily trend strength (ADX 14); high = strong trend
     bb_percent_b: float | None = None      # Bollinger %B: 0 = at lower band, 100 = at upper band
     recent_news_count: int | None = None   # # of recent headlines for the name (advisory context)
+    # Company quality/growth score (0-100), overlaid post-build by the scanner from the company-data
+    # provider. None = no company data / gate off. See scoring/quality.py.
+    quality_score: float | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -81,4 +84,7 @@ def passes_underlying_gates(ctx: UnderlyingContext, criteria: EntryCriteria) -> 
     if (criteria.min_bb_percent_b is not None and ctx.bb_percent_b is not None
             and ctx.bb_percent_b < criteria.min_bb_percent_b):
         return f"bb%b {ctx.bb_percent_b:.1f} < {criteria.min_bb_percent_b} (price at lower band)"
+    if (criteria.min_quality_score is not None and ctx.quality_score is not None
+            and ctx.quality_score < criteria.min_quality_score):
+        return f"quality {ctx.quality_score:.0f} < {criteria.min_quality_score:.0f} (low quality/growth)"
     return None

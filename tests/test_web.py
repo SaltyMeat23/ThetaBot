@@ -58,6 +58,26 @@ def ctx(tmp_path, monkeypatch):
                 entry_decisions=entry_decisions)
 
 
+def test_brief_endpoint_renders_and_degrades(ctx):
+    # No scanner/broker/tv in this fixture -> the brief must render (not 500) and degrade gracefully.
+    r = ctx["client"].get("/api/brief")
+    assert r.status_code == 200
+    j = r.json()
+    assert "Weekly tactical brief" in j["title"]
+    assert "NOT financial advice" in j["body"]
+    assert "## Market backdrop" in j["body"] and "## Broader portfolio" in j["body"]
+    assert "Regime data unavailable" in j["body"]  # last_regime is None here
+
+
+def test_dashboard_page_js_escapes_survive(ctx):
+    # Guard: the brief panel + its mdLite renderer are in the one inline <script>. A raw newline in
+    # the non-raw _PAGE string (e.g. split("\n") unescaped) would break ALL dashboard JS. Assert the
+    # served page carries the ESCAPED forms verbatim.
+    html = ctx["client"].get("/").text
+    assert 'id="brief"' in html and "brief-run" in html
+    assert r'split("\n")' in html   # backslash-n survived (not collapsed to a real newline)
+
+
 def test_health(ctx):
     r = ctx["client"].get("/health")
     assert r.status_code == 200
@@ -202,3 +222,40 @@ def test_pause_resume(ctx):
     assert ctx["killswitch"].is_paused() is True
     assert client.post(f"/control/resume?token={CONTROL}").json()["status"] == "resumed"
     assert ctx["killswitch"].is_paused() is False
+
+
+def test_api_quality_disabled_by_default(tmp_path):
+    """/api/quality reports disabled + empty when quality_scoring is off (the default)."""
+    from types import SimpleNamespace
+    db = Database(tmp_path / "q1.db")
+    audit = AuditStore(db)
+    client = TestClient(create_app(WebDeps(
+        settings=Settings(mode="paper"), signals=SignalStore(db), killswitch=KillSwitch(db, audit),
+        approval_gate=None, audit=audit, positions=PositionStore(db), orders=OrderStore(db),
+        decisions=DecisionStore(db), scanner=SimpleNamespace(last_quality={}, last_scan_at=None),
+    )))
+    r = client.get("/api/quality").json()
+    assert r["enabled"] is False
+    assert r["symbols"] == {}
+
+
+def test_api_quality_reports_readout(tmp_path):
+    """When scoring is on, /api/quality surfaces the per-name readout (informational only)."""
+    from types import SimpleNamespace
+    db = Database(tmp_path / "q2.db")
+    audit = AuditStore(db)
+    readout = {"CRWV": {"score": 37.0, "sector": "Technology Services", "gross_margin": 0.72,
+                        "net_margin": -0.24, "revenue_growth": None, "fcf_margin": -1.41,
+                        "gross_profitability": 0.07, "insider_net_buys_90d": 0,
+                        "subscores": {"profitability": 61, "cash": 0, "growth": None,
+                                      "momentum": 46, "insider_bonus": 0.0}}}
+    client = TestClient(create_app(WebDeps(
+        settings=Settings(mode="paper", entry={"quality_scoring": True}),
+        signals=SignalStore(db), killswitch=KillSwitch(db, audit), approval_gate=None, audit=audit,
+        positions=PositionStore(db), orders=OrderStore(db), decisions=DecisionStore(db),
+        scanner=SimpleNamespace(last_quality=readout, last_scan_at=None),
+    )))
+    r = client.get("/api/quality").json()
+    assert r["enabled"] is True
+    assert r["symbols"]["CRWV"]["fcf_margin"] == -1.41
+    assert r["symbols"]["CRWV"]["score"] == 37.0

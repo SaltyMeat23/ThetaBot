@@ -15,7 +15,10 @@ $5k to $500k):
   - liquidity (opt-in): never take more than max_pct_of_oi of a strike's open interest (fail-open on
     unknown OI) — stops a large account over-filling thin options
   - position count: min(target_positions, max_concurrent_positions) across open CSPs
-  - one CSP per underlying (no doubling up); skip names already held
+  - one CSP per underlying (no doubling up); skip names already held. OPT-IN override: when
+    max_pct_per_underlying is set, a name may hold multiple CSPs (laddered strikes/expiries and/or
+    more contracts) accumulated in ONE scan up to that fraction of account value; names already held
+    from a prior scan are still skipped (no averaging-in over days)
 """
 from __future__ import annotations
 
@@ -115,10 +118,15 @@ class RiskSizer:
         position_limit = (min(s.target_positions, s.max_concurrent_positions)
                           if s.target_positions else s.max_concurrent_positions)
         slots = max(0, position_limit - current_csp_count)
+        # Opt-in multi-CSP-per-name: a per-underlying collateral ceiling that supersedes the
+        # per-name cap and the one-per-scan rule (None = legacy one-CSP-per-underlying).
+        underlying_cap = (account_value * s.max_pct_per_underlying
+                          if s.max_pct_per_underlying is not None else None)
 
         approved: list[ApprovedEntry] = []
         rejected: list[tuple[EntryCandidate, str]] = []
         seen: set[str] = set()
+        name_committed: dict[str, float] = {}  # collateral approved this scan per underlying
         for c in candidates:
             if slots <= 0:
                 rejected.append((c, f"no capacity: position limit ({position_limit}) reached"))
@@ -127,20 +135,28 @@ class RiskSizer:
                 rejected.append((c, "no capacity: run budget exhausted"))
                 continue
             if c.underlying in held_underlyings:
-                rejected.append((c, f"already holding {c.underlying} (one CSP per underlying)"))
+                why = ("no add-over-time; already holding"
+                       if underlying_cap is not None else "one CSP per underlying; already holding")
+                rejected.append((c, f"{why} {c.underlying}"))
                 continue
-            if c.underlying in seen:
+            if underlying_cap is None and c.underlying in seen:
                 rejected.append((c, f"{c.underlying} already approved this scan (one per name)"))
                 continue
             per_contract = c.strike * CONTRACT_MULTIPLIER
             if per_contract <= 0:
                 rejected.append((c, "invalid strike (<= 0)"))
                 continue
-            # Per-name cap: under target_positions, allow >=1 contract of an affordable name but
-            # never exceed the backstop; legacy path uses the flat backstop cap.
-            per_name_cap = (min(backstop_cap, max(diversified_cap, per_contract))
-                            if diversified_cap is not None else backstop_cap)
-            by_name = math.floor(per_name_cap / per_contract)
+            if underlying_cap is not None:
+                # Multi-CSP: the ceiling is this name's remaining room under its per-underlying cap
+                # (accumulated across the rungs approved this scan). Supersedes the diversified/backstop
+                # per-name cap so the deliberate 15%-style ceiling can exceed max_position_size_pct.
+                per_name_cap = underlying_cap - name_committed.get(c.underlying, 0.0)
+            else:
+                # Per-name cap: under target_positions, allow >=1 contract of an affordable name but
+                # never exceed the backstop; legacy path uses the flat backstop cap.
+                per_name_cap = (min(backstop_cap, max(diversified_cap, per_contract))
+                                if diversified_cap is not None else backstop_cap)
+            by_name = math.floor(per_name_cap / per_contract) if per_name_cap > 0 else 0
             by_budget = math.floor(run_budget / per_contract)
             by_liq = _liquidity_cap(c, s)
             contracts = min(by_name, by_budget, by_liq)
@@ -154,6 +170,7 @@ class RiskSizer:
             collateral = contracts * per_contract
             approved.append(ApprovedEntry(candidate=c, contracts=contracts, collateral=collateral))
             seen.add(c.underlying)
+            name_committed[c.underlying] = name_committed.get(c.underlying, 0.0) + collateral
             run_budget -= collateral
             slots -= 1
         return SizingResult(approved=approved, rejected=rejected)

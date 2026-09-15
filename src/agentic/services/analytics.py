@@ -56,6 +56,9 @@ _DIMENSIONS: dict[str, Callable[[dict[str, Any]], Any]] = {
                                     ["<20", "20-40", "40-60", "60-80", "80+"]),
     "iv_rank": lambda r: _band(_ctx(r).get("iv_rank"), [25, 50, 75],
                                ["<25", "25-50", "50-75", "75+"]),
+    "quality_score": lambda r: _band(_ctx(r).get("quality_score"), [40, 55, 70],
+                                     ["<40", "40-55", "55-70", "70+"]),  # company quality/growth tilt
+
     "iv_rv_ratio": lambda r: _band(_ctx(r).get("iv_rv_ratio"), [0.9, 1.1, 1.4],
                                    ["<0.9", "0.9-1.1", "1.1-1.4", "1.4+"]),
     "mkt_regime": lambda r: _ctx(r).get("mkt_regime"),   # market regime at entry (calm/elevated/risk_off)

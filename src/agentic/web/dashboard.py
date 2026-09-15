@@ -12,6 +12,7 @@ vanilla JS so there is no build step and nothing to bundle.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Body, Depends
@@ -25,6 +26,19 @@ if TYPE_CHECKING:
     from .app import WebDeps
 
 
+def _sector_exposure(positions, riskcfg, account_value):
+    """Current short-put collateral grouped by sector — a concentration signal for the tactical read.
+    Filters to open positions, then reuses risk_breaker.sector_exposure so the math never drifts."""
+    from ..services.risk_breaker import sector_exposure
+    open_pos = [p for p in positions
+                if str(getattr(getattr(p, "status", None), "value", getattr(p, "status", None)))
+                in ("OPEN", "CLOSING")]
+    exp = sector_exposure(open_pos, getattr(riskcfg, "sector_map", None))
+    return [{"sector": k, "collateral": round(v, 0),
+             "pct_of_account": round(v / account_value * 100, 1) if account_value else None}
+            for k, v in sorted(exp.items(), key=lambda x: -x[1])]
+
+
 def make_dashboard_router(deps: "WebDeps") -> APIRouter:
     # All dashboard + data routes require auth (when a password is configured).
     router = APIRouter(dependencies=[Depends(require_auth)])
@@ -32,10 +46,27 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
     @router.get("/api/stats")
     async def api_stats() -> dict:
         # Live mode: show only real trades (exclude leftover paper-soak history).
-        return compute_stats(
-            deps.positions.list_all(), deps.orders.list_all(), deps.decisions.recent(1000),
-            real_only=deps.settings.is_live,
-        )
+        positions = deps.positions.list_all()
+        orders = deps.orders.list_all()
+        decisions = deps.decisions.recent(1000)
+        real_only = deps.settings.is_live
+        # Top-level numbers are ALL-TIME (the dashboard's headline P&L). ``this_week`` re-runs the
+        # same aggregation windowed to trades resolved since the most recent Monday 00:00 UTC — the
+        # market week — so the card can show both without double-counting or a separate code path.
+        stats = compute_stats(positions, orders, decisions, real_only=real_only)
+        now = datetime.now(timezone.utc)
+        week_start = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        wk = compute_stats(positions, orders, decisions, since=week_start, real_only=real_only)
+        stats["this_week"] = {
+            "since": week_start.date().isoformat(),
+            "realized_pnl": wk["realized_pnl"],
+            "wins": wk["wins"],
+            "losses": wk["losses"],
+            "resolved_count": wk["resolved_count"],
+            "win_rate": wk["win_rate"],
+        }
+        return stats
 
     @router.get("/api/positions")
     async def api_positions() -> dict:
@@ -87,6 +118,48 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         The negative-example dataset for refining entry logic."""
         store = deps.entry_candidates
         return {"candidates": store.recent(limit) if store is not None else []}
+
+    @router.get("/api/option-oi")
+    async def api_option_oi(symbol: str, dte_max: int = 75) -> dict:
+        """Read-only option-chain OPEN INTEREST + volume (calls AND puts) for one underlying.
+
+        Sourced via the LIVE Robinhood MCP — Alpaca's option snapshots do not carry open interest.
+        Reuses the bot's OWN broker instance so the OAuth session lock is shared (no separate session
+        that could race a token refresh). Fail-open: returns available=False when RH isn't the broker
+        or the fetch fails, so it never disturbs trading."""
+        sym = symbol.upper()
+        sc = deps.scanner
+        broker = getattr(sc, "broker", None) if sc else None
+        if broker is None or not hasattr(broker, "_call_tool"):
+            return {"symbol": sym, "available": False,
+                    "reason": "Robinhood MCP broker not active (Alpaca carries no OI)."}
+        try:
+            from datetime import date as _date
+
+            from ..marketdata.robinhood_md import RobinhoodMarketData
+            md = RobinhoodMarketData(broker, dte_window_days=dte_max)
+            chain = await md.get_chain(sym)
+        except Exception as exc:  # noqa: BLE001 — advisory read; never crash the dashboard
+            return {"symbol": sym, "available": False, "reason": f"chain fetch failed: {exc}"}
+        today = _date.today()
+        rows, call_oi, put_oi, call_vol, put_vol = [], 0, 0, 0, 0
+        for c in chain:
+            ot = str(getattr(c.option_type, "value", c.option_type)).lower()
+            oi, vol = (c.open_interest or 0), (c.volume or 0)
+            if ot == "call":
+                call_oi += oi; call_vol += vol
+            elif ot == "put":
+                put_oi += oi; put_vol += vol
+            rows.append({"type": ot, "strike": c.strike, "expiration": c.expiration.isoformat(),
+                         "dte": (c.expiration - today).days, "delta": c.delta, "iv": c.iv,
+                         "open_interest": c.open_interest, "volume": c.volume, "mark": c.mark})
+        rows.sort(key=lambda r: (r["open_interest"] or 0), reverse=True)
+        return {"symbol": sym, "available": True, "count": len(rows),
+                "summary": {"call_oi": call_oi, "put_oi": put_oi,
+                            "call_put_oi_ratio": round(call_oi / put_oi, 2) if put_oi else None,
+                            "call_vol": call_vol, "put_vol": put_vol,
+                            "call_put_vol_ratio": round(call_vol / put_vol, 2) if put_vol else None},
+                "contracts": rows[:150]}
 
     @router.post("/api/screen")
     async def api_screen(body: dict = Body(default={})) -> dict:
@@ -161,6 +234,21 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         return {
             "scanned_at": scanned.isoformat() if scanned else None,
             "symbols": {sym: c.as_dict() for sym, c in ctx.items()},
+        }
+
+    @router.get("/api/quality")
+    async def api_quality() -> dict:
+        """Per-watchlist-symbol company-quality readout from the last scan — the 0-100 score plus
+        the raw fundamentals behind it (margins, FCF, revenue growth, insider buys, sector).
+        INFORMATIONAL ONLY: this is a 'is this name actually profitable/decent?' view and does not
+        affect which trades are placed (see entry.quality_scoring). Empty unless scoring is enabled."""
+        sc = deps.scanner
+        q = getattr(sc, "last_quality", {}) if sc is not None else {}
+        scanned = getattr(sc, "last_scan_at", None) if sc is not None else None
+        return {
+            "enabled": bool(getattr(deps.settings.entry, "quality_scoring", False)),
+            "scanned_at": scanned.isoformat() if scanned else None,
+            "symbols": q,
         }
 
     @router.get("/api/scan-status")
@@ -377,6 +465,150 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             "regime": reg.as_dict() if reg is not None else None,
         }
 
+    @router.get("/api/brief")
+    async def api_brief() -> dict:
+        """On-demand weekly tactical prep brief (markdown): market backdrop, this week's catalysts,
+        per-watchlist levels + the bot's mechanical rule-based strike targets, and advisory CC/CSP
+        ideas across every account. DESCRIPTIVE ONLY — not financial advice. Read-only; hits the broker
+        for cross-account holdings, so it is deliberately not part of the auto-refresh poll."""
+        from datetime import datetime, timezone
+
+        from ..marketdata.econ_calendar import load_econ_calendar, upcoming_events
+        from ..services.weekly_brief import build_weekly_brief
+
+        s, sc = deps.settings, deps.scanner
+        now = datetime.now(timezone.utc)
+        watchlist = list(s.entry.watchlist)
+        try:
+            ctxs = getattr(sc, "last_context", {}) if sc else {}
+            contexts = {sym: ctxs[sym].as_dict() for sym in watchlist if sym in ctxs}
+            cands = list(getattr(sc, "last_candidates", []) or []) if sc else []
+            candidates = [{"underlying": c.underlying, "strike": c.strike, "delta": c.delta,
+                           "dte": c.dte, "premium": c.premium, "iv": c.iv,
+                           "annualized_ror": c.annualized_ror, "break_even": c.break_even,
+                           "theta_efficiency": c.theta_efficiency, "open_interest": c.open_interest}
+                          for c in cands]
+
+            tv_by_symbol: dict = {}
+            if deps.tv_indicators is not None:
+                max_age = s.ai.tv_indicator_max_age_seconds
+                for sym in watchlist:
+                    snap = deps.tv_indicators.get_latest(sym, max_age)
+                    tv_by_symbol[sym] = (snap or {}).get("payload", {}) if snap else {}
+
+            reg = getattr(sc, "last_regime", None) if sc else None
+            regime = reg.as_dict() if reg is not None else None
+
+            news_by_symbol: dict = {}
+            news_store = getattr(deps, "news", None)
+            news_cfg = getattr(s, "news", None)
+            if news_store is not None and getattr(news_cfg, "enabled", False):
+                for sym in watchlist:
+                    try:
+                        items = news_store.recent_for(
+                            sym, max_age_seconds=news_cfg.max_age_hours * 3600, limit=1)
+                        if items:
+                            news_by_symbol[sym] = items[0].get("headline") or ""
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            accounts: list = []
+            broker = getattr(sc, "broker", None) if sc else None
+            md = getattr(sc, "market_data", None) if sc else None
+            if broker is not None and md is not None:
+                from ..services.account_options import _advisory_criteria, account_option_suggestions
+                from ..services.screening import screen_universe
+                try:
+                    csp = await screen_universe(md, watchlist, _advisory_criteria(s.entry.criteria), limit=60)
+                except Exception:  # noqa: BLE001
+                    csp = []
+                try:
+                    nums = [a.get("account_number") for a in await broker.list_accounts()
+                            if a.get("account_number")]
+                except Exception:  # noqa: BLE001
+                    nums = []
+                for num in nums:
+                    try:
+                        accounts.append(await account_option_suggestions(broker, md, s, num, csp_candidates=csp))
+                    except Exception as exc:  # noqa: BLE001
+                        accounts.append({"account_number": num, "error": str(exc)})
+
+            econ_events = upcoming_events(load_econ_calendar(), now.date(), 7)
+
+            # Rich context for the AI tactical read — all in-process, each fail-open.
+            skips = list(getattr(sc, "last_skips", []) or []) if sc else []
+            try:
+                from ..services.analytics import build_feature_analytics
+                from ..services.refinement import build_refinement_rows
+                flywheel = build_feature_analytics(
+                    build_refinement_rows(deps.trade_journal, deps.ai_reviews, 1000)
+                ) if deps.trade_journal is not None else None
+            except Exception:  # noqa: BLE001
+                flywheel = None
+            try:
+                pos_all = deps.positions.list_all()  # fetched once, shared by stats + exposure
+            except Exception:  # noqa: BLE001
+                pos_all = []
+            try:
+                from ..services.stats import compute_stats
+                stats = compute_stats(pos_all, deps.orders.list_all(),
+                                      deps.decisions.recent(1000), real_only=s.is_live)
+            except Exception:  # noqa: BLE001
+                stats = None
+            try:
+                from ..services.risk_breaker import evaluate_risk_breaker
+                acct_no = getattr(s.robinhood, "account_number", None)
+                acct_val = next((a.get("account_value") for a in accounts
+                                 if a.get("account_number") == acct_no), None)
+                if acct_val is None:
+                    acct_val = sum(a.get("account_value", 0) or 0 for a in accounts if "error" not in a) or None
+                lb = evaluate_risk_breaker(deps.trade_journal, s.risk, acct_val, now)
+                risk = {"loss_breaker": {k: lb.get(k) for k in
+                        ("tripped", "reason", "window_realized", "loss_limit", "consecutive_losses")},
+                        "sector_exposure": _sector_exposure(pos_all, s.risk, acct_val)}
+            except Exception:  # noqa: BLE001
+                risk = None
+            try:
+                ai_reviews = (deps.ai_reviews.recent(8) if deps.ai_reviews is not None else []) or []
+            except Exception:  # noqa: BLE001
+                ai_reviews = []
+
+            # Open short options (for the management + assignment-capacity reads) and total buying
+            # power across accounts. Drop paper positions in live mode.
+            try:
+                open_positions = [p for p in pos_all
+                                  if str(getattr(getattr(p, "status", None), "value",
+                                                 getattr(p, "status", None))).upper() in ("OPEN", "CLOSING")
+                                  and not (s.is_live and getattr(p, "is_paper", False))]
+            except Exception:  # noqa: BLE001
+                open_positions = []
+            total_bp = sum(a.get("buying_power", 0) or 0
+                           for a in accounts if "error" not in a) or None
+
+            ai_analysis = None  # optional Claude tactical synthesis; fail-open to deterministic brief
+            try:
+                from ..ai.brief_analysis import generate_brief_analysis
+                from ..ai.client import build_reviewer_client
+                client = build_reviewer_client(s.ai)
+                if client is not None:
+                    ai_analysis = await generate_brief_analysis(
+                        client, watchlist=watchlist, contexts=contexts, candidates=candidates,
+                        tv_by_symbol=tv_by_symbol, regime=regime, econ_events=econ_events,
+                        flywheel=flywheel, skips=skips, accounts=accounts, stats=stats,
+                        risk=risk, ai_reviews=ai_reviews, open_positions=open_positions,
+                        total_buying_power=total_bp)
+            except Exception:  # noqa: BLE001 — AI is advisory; the brief renders without it
+                ai_analysis = None
+
+            title, body = build_weekly_brief(
+                watchlist=watchlist, contexts=contexts, candidates=candidates,
+                tv_by_symbol=tv_by_symbol, regime=regime, news_by_symbol=news_by_symbol,
+                accounts=accounts, econ_events=econ_events, now=now, ai_analysis=ai_analysis,
+                open_positions=open_positions, total_buying_power=total_bp)
+            return {"title": title, "body": body}
+        except Exception as exc:  # noqa: BLE001 — a brief must never 500 the dashboard
+            return {"title": "Weekly tactical brief", "body": f"Brief unavailable: {exc}"}
+
     @router.get("/api/ai-reviews")
     async def api_ai_reviews(limit: int = 100) -> dict:
         store = deps.ai_reviews
@@ -524,6 +756,21 @@ _PAGE = """<!doctype html>
   .grid{display:grid;grid-template-columns:1fr 300px;gap:16px;align-items:start}
   @media (max-width:760px){.grid{grid-template-columns:1fr}}
   .col{display:flex;flex-direction:column;gap:16px;min-width:0}
+  /* tab navigation — sticky, horizontally scrollable on mobile so every view is one tap away */
+  .tabs{position:sticky;top:0;z-index:30;display:flex;gap:6px;overflow-x:auto;padding:9px 2px;margin:0 -2px;
+    background:color-mix(in srgb,var(--paper) 88%,transparent);backdrop-filter:blur(8px);
+    border-bottom:1px solid var(--line);-webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .nav-dot{width:9px;height:9px;border-radius:50%;background:var(--faint);align-self:center;margin:0 4px 0 2px;flex:none}
+  .nav-dot.good{background:var(--pos)} .nav-dot.warn{background:var(--warn)} .nav-dot.bad{background:var(--neg)}
+  .tab-btn{flex:0 0 auto;background:var(--card);border:1px solid var(--line);border-radius:999px;
+    padding:8px 17px;font:inherit;font-size:13.5px;font-weight:600;color:var(--muted);cursor:pointer;
+    white-space:nowrap;transition:background .12s,color .12s}
+  .tab-btn:hover{color:var(--ink)}
+  .tab-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .tab-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  .tabpane[hidden]{display:none}
+  .tabpane{display:flex;flex-direction:column;gap:16px}
   .card2{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
   .card-h{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px 0}
   .card-h h2{font-size:13px;font-weight:650;margin:0}
@@ -532,6 +779,9 @@ _PAGE = """<!doctype html>
   .pos-item{padding:16px} .pos-item + .pos-item{border-top:1px solid var(--line)}
   .pos-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
   .tick{font-size:17px;font-weight:700;letter-spacing:-.01em}
+  .tlogo{display:inline-flex;width:26px;height:26px;margin-right:8px;vertical-align:middle}
+  .tlogo img{width:26px;height:26px;border-radius:6px;object-fit:contain;background:#fff;border:1px solid var(--line)}
+  .tmono{width:26px;height:26px;border-radius:6px;place-items:center;font-size:12px;font-weight:700;color:#fff}
   .tick .kind{font-size:12px;font-weight:600;color:var(--muted);margin-left:8px}
   .pos-sub{font-size:12.5px;color:var(--muted);margin-top:3px}
   .pnl{text-align:right;flex:none}
@@ -562,6 +812,8 @@ _PAGE = """<!doctype html>
   .stat .k{font-size:13px;color:var(--muted)}
   .stat .v{font-size:17px;font-weight:700;font-family:var(--mono);font-variant-numeric:tabular-nums}
   .badge{font-size:11px;font-weight:650;padding:2px 8px;border-radius:999px;background:var(--pos-bg);color:var(--pos)}
+  .wkline{padding:10px 16px;border-top:1px solid var(--line);font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .wkline .wklbl{color:var(--faint);font-weight:650;margin-right:6px}
   /* controls */
   .ctl{padding:14px 16px}
   .ctl-lab{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);font-weight:600;margin-bottom:8px}
@@ -603,12 +855,7 @@ _PAGE = """<!doctype html>
   .ev-t{font-size:13.5px;font-weight:600}
   .ev-d{font-size:12.5px;color:var(--muted);margin-top:1px;overflow-wrap:anywhere}
   .ev-when{font-size:11.5px;color:var(--faint);white-space:nowrap;flex:none}
-  /* details */
-  details.more{background:var(--card);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow)}
-  details.more>summary{cursor:pointer;padding:14px 16px;font-size:13px;font-weight:650;list-style:none;display:flex;align-items:center;gap:8px}
-  details.more>summary::-webkit-details-marker{display:none}
-  details.more>summary::before{content:"▸";color:var(--faint)}
-  details.more[open]>summary::before{content:"▾"}
+  /* detail tables */
   .more-body{padding:0 16px 16px;overflow-x:auto}
   .more-body h3{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--faint);margin:18px 0 8px}
   table{width:100%;border-collapse:collapse;font-size:12.5px}
@@ -640,6 +887,16 @@ _PAGE = """<!doctype html>
     <div class="ribbon-note" id="conn-note">This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.</div>
   </div>
 
+  <nav class="tabs" id="tabs">
+    <span class="nav-dot" id="nav-status" title="Robinhood connection"></span>
+    <button class="tab-btn" data-tab="overview">Overview</button>
+    <button class="tab-btn" data-tab="research">Watchlist</button>
+    <button class="tab-btn" data-tab="brief">Brief</button>
+    <button class="tab-btn" data-tab="tuning">Tuning</button>
+    <button class="tab-btn" data-tab="history">History</button>
+  </nav>
+
+  <div class="tabpane" id="pane-overview">
   <div class="grid">
     <div class="col">
       <section class="card2">
@@ -655,42 +912,44 @@ _PAGE = """<!doctype html>
 
     <div class="col">
       <section class="card2">
-        <div class="card-h"><h2>This week</h2><span class="count">real trades</span></div>
+        <div class="card-h"><h2>Overall</h2><span class="count">all-time · real trades</span></div>
         <div id="week"></div>
-      </section>
-
-      <section class="card2">
-        <div class="card-h"><h2>Scanner</h2></div>
-        <div class="ctl">
-          <div class="ctl-lab">Watching for new puts <span id="wl-count" class="count"></span></div>
-          <div class="wl" id="wl"></div>
-          <div class="row">
-            <input class="f" id="wl-in" placeholder="Add ticker, e.g. AAPL" maxlength="6"
-              autocapitalize="characters" autocomplete="off"/>
-            <button class="go" id="wl-add">Add</button>
-          </div>
-          <div class="hint">Aim for 10–25 names you'd be happy to own. Changes apply live.</div>
-          <div class="say" id="wl-say"></div>
-
-          <div class="ctl-lab" style="margin-top:16px">Weekly premium target</div>
-          <div class="row">
-            <input class="f wk mono" id="wk-in" inputmode="decimal" placeholder="0"/>
-            <span class="muted" style="font-size:13px">% of account</span>
-            <button class="go" id="wk-save">Save</button>
-          </div>
-          <div class="hint">Past this, new entries wait for your one-tap OK instead of auto-firing. 0 = off.</div>
-          <div class="say" id="wk-say"></div>
-
-          <div class="scanline" id="scanline"></div>
-        </div>
-      </section>
-
-      <section class="card2">
-        <div class="card-h"><h2>TradingView levels</h2><span class="count" id="tv-last"></span></div>
-        <div class="ctl" id="tv-levels"></div>
       </section>
     </div>
   </div>
+  </div>
+
+  <div class="tabpane" id="pane-research" hidden>
+  <section class="card2">
+    <div class="card-h"><h2>Scanner</h2></div>
+    <div class="ctl">
+      <div class="ctl-lab">Watching for new puts <span id="wl-count" class="count"></span></div>
+      <div class="wl" id="wl"></div>
+      <div class="row">
+        <input class="f" id="wl-in" placeholder="Add ticker, e.g. AAPL" maxlength="6"
+          autocapitalize="characters" autocomplete="off"/>
+        <button class="go" id="wl-add">Add</button>
+      </div>
+      <div class="hint">Aim for 10–25 names you'd be happy to own. Changes apply live.</div>
+      <div class="say" id="wl-say"></div>
+
+      <div class="ctl-lab" style="margin-top:16px">Weekly premium target</div>
+      <div class="row">
+        <input class="f wk mono" id="wk-in" inputmode="decimal" placeholder="0"/>
+        <span class="muted" style="font-size:13px">% of account</span>
+        <button class="go" id="wk-save">Save</button>
+      </div>
+      <div class="hint">Past this, new entries wait for your one-tap OK instead of auto-firing. 0 = off.</div>
+      <div class="say" id="wk-say"></div>
+
+      <div class="scanline" id="scanline"></div>
+    </div>
+  </section>
+
+  <section class="card2">
+    <div class="card-h"><h2>TradingView levels</h2><span class="count" id="tv-last"></span></div>
+    <div class="ctl" id="tv-levels"></div>
+  </section>
 
   <section class="card2" id="screener">
     <div class="card-h"><h2>Screener</h2><span class="count">on-demand CSP scan</span></div>
@@ -719,8 +978,79 @@ _PAGE = """<!doctype html>
     </div>
   </section>
 
-  <details class="more">
-    <summary>Detailed data — opportunities, holdings, entries, journal, all decisions</summary>
+  <section class="card2" id="quality">
+    <div class="card-h"><h2>Company Quality</h2><span class="count" id="q-note">informational — not a trade input</span></div>
+    <div class="more-body" style="padding:0">
+      <table id="quality-tbl"><thead><tr>
+        <th>Symbol</th><th>Sector</th><th class="num">Score</th>
+        <th class="num">Gross&nbsp;M</th><th class="num">Net&nbsp;M</th><th class="num">Rev&nbsp;gr</th>
+        <th class="num">FCF&nbsp;M</th><th class="num">GP/A</th><th class="num">Insider&nbsp;90d</th>
+      </tr></thead><tbody><tr><td colspan="9" class="muted">Enable entry.quality_scoring to compute a per-name quality read.</td></tr></tbody></table>
+    </div>
+    <div class="hint">A 0–100 read on each watchlist name's fundamentals — margins, cash flow, revenue growth, insider buying — so you can eyeball "is this actually a decent company to own if assigned." Purely informational: it does <b>not</b> gate or rank trades.</div>
+  </section>
+  </div>
+
+  <div class="tabpane" id="pane-brief" hidden>
+  <section class="card2" id="brief">
+    <div class="card-h"><h2>Weekly Tactical Brief</h2><button id="brief-run">Generate</button></div>
+    <div class="more-body" style="padding:12px">
+      <div id="brief-body" class="muted">Monday prep: market backdrop, this week's catalysts, per-name levels + the strikes the bot's rules are eyeing, and advisory ideas across your accounts. Click <b>Generate</b> (reads your accounts live — takes a few seconds). Descriptive only — not financial advice.</div>
+    </div>
+  </section>
+  </div>
+
+  <div class="tabpane" id="pane-tuning" hidden>
+  <section class="card2">
+    <div class="card-h"><h2>Tuning</h2><span class="count">applies live · persists</span></div>
+    <div class="ctl">
+      <div class="ctl-lab">Multiple CSPs per ticker</div>
+      <div class="row">
+        <input class="f wk mono" id="tn-uc" inputmode="decimal" placeholder="0"/>
+        <span class="muted" style="font-size:13px">% max per name</span>
+        <button class="go" id="tn-uc-save">Save</button>
+      </div>
+      <div class="hint">Max % of account in one ticker's short-put collateral — laddered strikes / more contracts, built in a single scan (no adding over days). 0 = one CSP per name (default).</div>
+      <div class="say" id="tn-uc-say"></div>
+
+      <div class="ctl-lab" style="margin-top:18px">Entry quality gates</div>
+      <div class="scr-filters">
+        <label>Min cushion (exp-moves)<input class="f scrn" id="tn-em" inputmode="decimal" placeholder="off"/></label>
+        <label>Min IV / realized vol<input class="f scrn" id="tn-vrp" inputmode="decimal" placeholder="off"/></label>
+        <button class="go" id="tn-gates-save">Save gates</button>
+      </div>
+      <div class="hint"><b>Cushion</b>: require the strike to sit at least N option-implied expected-moves out of the money (scales to each name's volatility). <b>IV/RV</b>: only sell when implied vol beats realized by this ratio (e.g. 1.1). Blank = off.</div>
+      <div class="say" id="tn-gates-say"></div>
+
+      <div class="ctl-lab" style="margin-top:18px">Global screening</div>
+      <div class="scr-filters">
+        <label>&Delta; min<input class="f scrn" id="tn-dmin" inputmode="decimal"/></label>
+        <label>&Delta; max<input class="f scrn" id="tn-dmax" inputmode="decimal"/></label>
+        <button class="go" id="tn-global-save">Save</button>
+      </div>
+      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-ivrank"/> Prefer rich IV rank (rank by IV vs each name's own history)</label></div>
+      <div class="hint">The short-put delta band the scanner targets. Changes apply to the next scan.</div>
+      <div class="say" id="tn-global-say"></div>
+
+      <div class="ctl-lab" style="margin-top:18px">Per-ticker overrides <span id="tn-pt-cur" class="count"></span></div>
+      <div class="row">
+        <input class="f" id="tn-pt-sym" placeholder="Symbol, e.g. BULL" maxlength="6" autocapitalize="characters" autocomplete="off"/>
+      </div>
+      <div class="scr-filters">
+        <label>&Delta; max<input class="f scrn" id="tn-pt-dmax" inputmode="decimal" placeholder="—"/></label>
+        <label>Min IV rank<input class="f scrn" id="tn-pt-ivr" inputmode="decimal" placeholder="—"/></label>
+        <label>Min IV / RV<input class="f scrn" id="tn-pt-vrp" inputmode="decimal" placeholder="—"/></label>
+        <label>Min cushion<input class="f scrn" id="tn-pt-em" inputmode="decimal" placeholder="—"/></label>
+        <button class="go" id="tn-pt-save">Set overrides</button>
+      </div>
+      <div class="hint">Tailor one name (merged over the global criteria). Fill only what you want to override; blank = leave as-is. Removing an override still needs a config edit.</div>
+      <div id="tn-pt-list" class="tvcruft"></div>
+      <div class="say" id="tn-pt-say"></div>
+    </div>
+  </section>
+  </div>
+
+  <div class="tabpane" id="pane-history" hidden>
     <div class="more-body">
       <h3>Per-rule performance</h3>
       <table id="rules"><thead><tr><th>Rule</th><th class="num">Closes</th><th class="num">Wins</th>
@@ -750,7 +1080,7 @@ _PAGE = """<!doctype html>
         <th class="num">DTE</th><th class="num">IV</th><th class="num">Premium</th><th>Status</th>
         <th class="num">P&amp;L</th></tr></thead><tbody></tbody></table>
     </div>
-  </details>
+  </div>
 
   <div class="foot">Read-only monitoring · settings changes are logged · powered by AgenticRobinhood</div>
 </div></div>
@@ -764,6 +1094,14 @@ const money = (v) => v == null ? "—"
 const cls = (v) => v == null ? "muted" : v > 0 ? "pos-c" : v < 0 ? "neg" : "";
 const pct = (v) => v == null ? "—" : (v*100).toFixed(0) + "%";
 async function getJSON(u){ const r = await fetch(u,{credentials:"same-origin"}); if(!r.ok) throw new Error(u+" -> "+r.status); return r.json(); }
+function tickerLogo(sym){
+  const s = esc(sym);
+  const hue = [...s].reduce((a,c)=>a+c.charCodeAt(0),0)%360;
+  return `<span class="tlogo">`
+    + `<img src="https://assets.parqet.com/logos/symbol/${s}?format=png&size=52" alt="" loading="lazy" `
+    + `onerror="this.style.display='none';this.nextElementSibling.style.display='grid'">`
+    + `<span class="tmono" style="display:none;background:hsl(${hue},45%,45%)">${(s[0]||'?').toUpperCase()}</span></span>`;
+}
 
 /* ---- connection hero ---- */
 async function loadConn(){
@@ -771,7 +1109,8 @@ async function loadConn(){
   let st = {}, bs = {};
   try { st = await getJSON("/control/status"); } catch(e){
     top.innerHTML = `<span class="conn bad"><span class="dot"></span> Can't reach the bot</span>`;
-    note.innerHTML = `The dashboard couldn't load the bot's status. It may be redeploying — try again in a minute.`; return;
+    note.innerHTML = `The dashboard couldn't load the bot's status. It may be redeploying — try again in a minute.`;
+    const nd=$("nav-status"); if(nd) nd.className="nav-dot bad"; return;
   }
   try { bs = await getJSON("/control/broker-status"); } catch(e){ bs = {ok:false}; }
   const paper = bs.is_paper === true, live = st.mode === "live";
@@ -791,6 +1130,7 @@ async function loadConn(){
   note.innerHTML = (klass==="bad")
     ? `<b style="color:var(--neg)">Heads up:</b> the bot is not managing your real Robinhood positions right now.`
     : `This banner turns <b>red</b> the moment the bot loses its Robinhood connection or drops to the simulator.`;
+  const nd=$("nav-status"); if(nd) nd.className="nav-dot "+(klass||"good");
 }
 
 /* ---- holdings (plain english) ---- */
@@ -820,7 +1160,7 @@ async function loadHolds(){
     }
     return `<article class="pos-item">
       <div class="pos-top">
-        <div><div class="tick">${esc(p.underlying)} <span class="kind">$${p.strike} ${put?"put":"call"} · ${esc(p.strategy.replace(/_/g," ").toLowerCase())}</span></div>
+        <div><div class="tick">${tickerLogo(p.underlying)}${esc(p.underlying)} <span class="kind">$${p.strike} ${put?"put":"call"} · ${esc(p.strategy.replace(/_/g," ").toLowerCase())}</span></div>
           <div class="pos-sub">${p.quantity} contract${p.quantity>1?"s":""} · expires <b>${esc(new Date(p.expiration+"T00:00:00").toLocaleDateString(undefined,{month:"short",day:"numeric"}))}</b> · <b>${p.dte} day${p.dte===1?"":"s"} left</b></div></div>
         <div class="pnl"><div class="v ${cls(upnl)}">${money(upnl)}</div><div class="l">unrealized</div></div>
       </div>
@@ -844,11 +1184,17 @@ async function loadHolds(){
 /* ---- this week ---- */
 async function loadWeek(){
   const s = await getJSON("/api/stats");
+  const w = s.this_week || {};
+  const wn = w.resolved_count || 0;
+  const wk = wn
+    ? `<span class="${cls(w.realized_pnl)}">${money(w.realized_pnl)}</span> realized · ${wn} closed · ${pct(w.win_rate)} win`
+    : `<span class="v">no trades closed yet</span>`;
   $("week").innerHTML = `
     <div class="stat"><span class="k">Realized P&L</span><span class="v ${cls(s.realized_pnl)}">${money(s.realized_pnl)}</span></div>
     <div class="stat"><span class="k">Win rate</span><span class="v">${pct(s.win_rate)} <span class="badge">${s.wins} / ${s.resolved_count}</span></span></div>
     <div class="stat"><span class="k">Open now</span><span class="v">${s.open_count}</span></div>
-    <div class="stat"><span class="k">Unrealized</span><span class="v ${cls(s.unrealized_pnl)}">${money(s.unrealized_pnl)}</span></div>`;
+    <div class="stat"><span class="k">Unrealized</span><span class="v ${cls(s.unrealized_pnl)}">${money(s.unrealized_pnl)}</span></div>
+    <div class="wkline"><span class="wklbl">This week</span> ${wk}</div>`;
 }
 
 /* ---- activity ---- */
@@ -967,10 +1313,67 @@ async function runScan(){
 }
 async function loadControls(){
   const cfg = await getJSON("/api/config");
-  watchlist = (cfg.editable.entry.watchlist || []).slice();
+  const e = cfg.editable.entry || {};
+  watchlist = (e.watchlist || []).slice();
   renderWatchlist();
-  const wt = cfg.editable.entry.weekly_premium_target_pct;
+  const wt = e.weekly_premium_target_pct;
   if(document.activeElement !== $("wk-in")) $("wk-in").value = wt ? (wt*100).toFixed(wt*100 % 1 ? 1 : 0) : "0";
+  fillTuning(e);
+}
+function _setIf(id, v){ if(document.activeElement !== $(id)) $(id).value = (v==null ? "" : v); }
+function fillTuning(e){
+  const sz = e.sizing || {}, cr = e.criteria || {};
+  const uc = sz.max_pct_per_underlying;
+  _setIf("tn-uc", uc!=null ? (uc*100).toFixed(uc*100 % 1 ? 1 : 0) : "0");
+  _setIf("tn-em", cr.min_strike_expected_moves);
+  _setIf("tn-vrp", cr.min_iv_rv_ratio);
+  _setIf("tn-dmin", cr.delta_min);
+  _setIf("tn-dmax", cr.delta_max);
+  if(document.activeElement !== $("tn-ivrank")) $("tn-ivrank").checked = !!e.prefer_iv_rank;
+  renderPerTicker(e.per_ticker || {});
+}
+function renderPerTicker(map){
+  const keys = Object.keys(map || {});
+  $("tn-pt-cur").textContent = keys.length ? "("+keys.length+")" : "";
+  $("tn-pt-list").innerHTML = keys.length
+    ? keys.map(k => `<div><b>${esc(k)}</b>: ${esc(JSON.stringify(map[k]))}</div>`).join("")
+    : `<span class="muted" style="font-size:12px">No per-ticker overrides yet.</span>`;
+}
+function _numOrNull(id){ const r=($(id).value||"").trim(); if(r==="") return null; const v=parseFloat(r); return isNaN(v)?null:v; }
+async function saveMulti(){
+  const raw=($("tn-uc").value||"").trim(); const v=parseFloat(raw);
+  if(raw!=="" && (isNaN(v) || v<0 || v>50)){ say("tn-uc-say","Enter 0–50 (% of account).",false); return; }
+  const val = (!raw || v<=0) ? null : v/100;
+  try { await postConfig({entry:{sizing:{max_pct_per_underlying: val}}});
+    say("tn-uc-say", val ? ("Up to "+v+"% per ticker — multi-CSP on.") : "Off — one CSP per name.", true);
+  } catch(e){ say("tn-uc-say","Couldn't save: "+e.message,false); }
+}
+async function saveGates(){
+  try { await postConfig({entry:{criteria:{min_strike_expected_moves:_numOrNull("tn-em"), min_iv_rv_ratio:_numOrNull("tn-vrp")}}});
+    say("tn-gates-say","Gates saved.",true);
+  } catch(e){ say("tn-gates-say","Couldn't save: "+e.message,false); }
+}
+async function saveGlobal(){
+  const dmin=_numOrNull("tn-dmin"), dmax=_numOrNull("tn-dmax");
+  if(dmin==null || dmax==null || dmin<=0 || dmax<=0 || dmin>=dmax){ say("tn-global-say","Enter a valid delta band (min < max).",false); return; }
+  try { await postConfig({entry:{prefer_iv_rank:$("tn-ivrank").checked, criteria:{delta_min:dmin, delta_max:dmax}}});
+    say("tn-global-say","Saved.",true);
+  } catch(e){ say("tn-global-say","Couldn't save: "+e.message,false); }
+}
+async function savePerTicker(){
+  const sym=($("tn-pt-sym").value||"").trim().toUpperCase();
+  if(!/^[A-Z][A-Z.]{0,5}$/.test(sym)){ say("tn-pt-say","Enter a valid symbol.",false); return; }
+  const ov={};
+  const dmax=_numOrNull("tn-pt-dmax"); if(dmax!=null) ov.delta_max=dmax;
+  const ivr=_numOrNull("tn-pt-ivr"); if(ivr!=null) ov.min_iv_rank=ivr;
+  const vrp=_numOrNull("tn-pt-vrp"); if(vrp!=null) ov.min_iv_rv_ratio=vrp;
+  const em=_numOrNull("tn-pt-em"); if(em!=null) ov.min_strike_expected_moves=em;
+  if(!Object.keys(ov).length){ say("tn-pt-say","Fill at least one field to override.",false); return; }
+  try { const j = await postConfig({entry:{per_ticker:{[sym]:ov}}});
+    renderPerTicker((j.editable.entry||{}).per_ticker||{});
+    say("tn-pt-say","Saved overrides for "+sym+".",true);
+    ["tn-pt-sym","tn-pt-dmax","tn-pt-ivr","tn-pt-vrp","tn-pt-em"].forEach(id=>$(id).value="");
+  } catch(e){ say("tn-pt-say","Couldn't save: "+e.message,false); }
 }
 function renderWatchlist(){
   $("wl-count").textContent = watchlist.length ? "("+watchlist.length+")" : "";
@@ -1069,12 +1472,59 @@ async function loadTables(){
     || `<tr><td colspan="9" class="muted">no journaled trades yet</td></tr>`;
 }
 
+async function loadQuality(){
+  const d = await getJSON("/api/quality");
+  const tb = $("quality-tbl").querySelector("tbody");
+  const note = $("q-note");
+  if(!d.enabled){
+    if(note) note.textContent = "off";
+    tb.innerHTML = `<tr><td colspan="9" class="muted">Company quality scoring is off — set entry.quality_scoring: true (informational; does not affect trading).</td></tr>`;
+    return;
+  }
+  if(note) note.textContent = "informational — not a trade input";
+  const syms = d.symbols || {}; const keys = Object.keys(syms).sort();
+  if(!keys.length){
+    tb.innerHTML = `<tr><td colspan="9" class="muted">No quality data yet — waiting for the next scan.</td></tr>`;
+    return;
+  }
+  const pct = (x)=> x!=null ? (x*100).toFixed(0)+"%" : "—";
+  const sc  = (x)=> x!=null ? Number(x).toFixed(0) : "—";
+  tb.innerHTML = keys.map(k=>{ const q = syms[k]||{}; return `<tr>
+    <td>${esc(k)}</td><td class="muted">${esc(q.sector)||"—"}</td>
+    <td class="num"><b>${sc(q.score)}</b></td>
+    <td class="num">${pct(q.gross_margin)}</td><td class="num">${pct(q.net_margin)}</td>
+    <td class="num">${pct(q.revenue_growth)}</td><td class="num">${pct(q.fcf_margin)}</td>
+    <td class="num">${q.gross_profitability!=null?Number(q.gross_profitability).toFixed(2):"—"}</td>
+    <td class="num">${q.insider_net_buys_90d!=null?q.insider_net_buys_90d:"—"}</td></tr>`; }).join("");
+}
+
+function mdLite(s){
+  const esc2=(t)=>t.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const bold=(t)=>t.replace(/\\*\\*(.+?)\\*\\*/g,"<b>$1</b>");
+  return esc2(s).split("\\n").map(line=>{
+    if(line.startsWith("### ")) return "<h4 style='margin:10px 0 4px'>"+bold(line.slice(4))+"</h4>";
+    if(line.startsWith("## "))  return "<h3 style='margin:14px 0 6px'>"+bold(line.slice(3))+"</h3>";
+    if(line.startsWith("# "))   return "<h2 style='margin:4px 0 8px'>"+bold(line.slice(2))+"</h2>";
+    if(line.startsWith("- "))   return "<div style='margin-left:1em'>&bull; "+bold(line.slice(2))+"</div>";
+    if(line.startsWith("> "))   return "<div class='muted' style='font-style:italic'>"+bold(line.slice(2))+"</div>";
+    if(line.startsWith("_") && line.endsWith("_")) return "<div class='muted' style='font-style:italic'>"+bold(line.slice(1,-1))+"</div>";
+    if(line.trim()==="") return "<div style='height:6px'></div>";
+    return "<div>"+bold(line)+"</div>";
+  }).join("");
+}
+async function loadBrief(){
+  const el = $("brief-body");
+  el.textContent = "Building brief… (reading your accounts live — a few seconds)";
+  try { const d = await getJSON("/api/brief"); el.innerHTML = mdLite(d.body||""); }
+  catch(e){ el.textContent = "Failed to build brief: "+e.message; }
+}
+
 /* ---- orchestration ---- */
 let lastLoad = 0;
 async function loadAll(){
   for (const [fn,name] of [[loadConn,"conn"],[loadHolds,"holds"],[loadWeek,"week"],
                            [loadFeed,"feed"],[loadScanStatus,"scan"],[loadTvLevels,"tv"],
-                           [loadTables,"tables"]]) {
+                           [loadQuality,"quality"],[loadTables,"tables"]]) {
     try { await fn(); } catch(e){ console.error(name, e); }
   }
   lastLoad = Date.now();
@@ -1084,12 +1534,29 @@ function tickAgo(){
   const s = Math.round((Date.now()-lastLoad)/1000);
   $("ago").textContent = s < 5 ? "Updated just now" : "Updated " + s + "s ago";
 }
+$("brief-run").onclick = loadBrief;
 $("scr-run").onclick = runScreen;
 $("scr-scan").onclick = runScan;
 $("wl-add").onclick = addTicker;
 $("wl-in").addEventListener("keydown", e => { if(e.key==="Enter") addTicker(); });
 $("wk-save").onclick = saveWeekly;
 $("wk-in").addEventListener("keydown", e => { if(e.key==="Enter") saveWeekly(); });
+$("tn-uc-save").onclick = saveMulti;
+$("tn-gates-save").onclick = saveGates;
+$("tn-global-save").onclick = saveGlobal;
+$("tn-pt-save").onclick = savePerTicker;
+
+/* ---- tab navigation ---- */
+function showTab(name){
+  document.querySelectorAll(".tabpane").forEach(p => { p.hidden = (p.id !== "pane-"+name); });
+  document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab===name));
+  try { localStorage.setItem("tc_tab", name); } catch(e){}
+  window.scrollTo({top:0});
+}
+document.querySelectorAll(".tab-btn").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+(function(){ let t = "overview"; try { t = localStorage.getItem("tc_tab") || "overview"; } catch(e){}
+  if(!document.getElementById("pane-"+t)) t = "overview"; showTab(t); })();
+
 loadControls().catch(e=>console.error("controls",e));
 loadAll();
 setInterval(loadAll, 25000);   // auto-refresh data (controls are loaded on demand, never clobbered)

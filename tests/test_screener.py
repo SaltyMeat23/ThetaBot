@@ -1,8 +1,9 @@
 """CSP screener: criteria filtering, math, liquidity hygiene, ranking."""
 from datetime import date, timedelta
+from types import SimpleNamespace
 
 from agentic.config import EntryCriteria
-from agentic.entry.screener import screen_candidates
+from agentic.entry.screener import EntryCandidate, passes_candidate_gates, screen_candidates
 from agentic.marketdata.quote import OptionContractQuote
 
 TODAY = date(2026, 6, 28)
@@ -94,3 +95,36 @@ def test_support_ceiling_none_is_no_gate():
     chain = [_put(100, 35, -0.25, 2.40, 2.60), _put(90, 35, -0.28, 2.20, 2.35)]
     out = screen_candidates("X", chain, CRIT, today=TODAY, support_ceiling=None)
     assert {c.strike for c in out} == {100.0, 90.0}
+
+
+# --- context-aware candidate gates: expected-move cushion + VRP floor ----------------------------
+
+def _egcand(strike=90, iv=0.60, dte=11):
+    return EntryCandidate(
+        underlying="X", occ_symbol="X", option_id=None, strike=strike,
+        expiration=TODAY + timedelta(days=dte), dte=dte, delta=-0.25, iv=iv, premium=0.3,
+        ror=1.0, annualized_ror=30.0, max_risk=strike * 100, break_even=strike - 0.3,
+        open_interest=500, volume=50, score=1.0)
+
+
+def test_vrp_floor_gate():
+    ctx = SimpleNamespace(realized_vol=0.66, price=100.0)
+    crit = EntryCriteria(min_iv_rv_ratio=1.1)
+    r = passes_candidate_gates(_egcand(iv=0.60), ctx, crit)   # 0.60/0.66 = 0.91 < 1.1
+    assert r is not None and "iv/rv" in r
+    assert passes_candidate_gates(_egcand(iv=0.80), ctx, crit) is None   # 0.80/0.66 = 1.21 passes
+
+
+def test_expected_move_cushion_gate():
+    ctx = SimpleNamespace(realized_vol=0.66, price=100.0)
+    crit = EntryCriteria(min_strike_expected_moves=1.0)  # EM ~ 10.4 at iv 0.60, 11 DTE
+    assert passes_candidate_gates(_egcand(strike=95), ctx, crit) is not None   # 0.48 EM -> thin
+    assert passes_candidate_gates(_egcand(strike=80), ctx, crit) is None       # 1.9 EM -> passes
+
+
+def test_candidate_gates_fail_open_on_missing_data():
+    crit = EntryCriteria(min_iv_rv_ratio=1.1, min_strike_expected_moves=1.0)
+    assert passes_candidate_gates(
+        _egcand(), SimpleNamespace(realized_vol=None, price=None), crit) is None
+    assert passes_candidate_gates(_egcand(), SimpleNamespace(realized_vol=0.66, price=100.0),
+                                  EntryCriteria()) is None   # both gates off -> passes

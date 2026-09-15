@@ -125,6 +125,54 @@ def test_evaluate_reason_held_name():
     assert any("already holding A" in reason for _c, reason in res.rejected)
 
 
+# --- opt-in multi-CSP per underlying (max_pct_per_underlying) ------------------------------------
+
+MULTI = EntrySizing(
+    max_position_size_pct=0.10, max_concurrent_positions=5,
+    total_bp_utilization_target=0.50, buying_power_reserve_pct=0.10,
+    max_pct_per_underlying=0.15,
+)
+
+
+def test_multi_csp_more_contracts_up_to_per_name_cap():
+    # cap ON: 15% of 100k = 15k -> 3 contracts of a 5k strike (the per-underlying cap supersedes
+    # the 10% backstop, which would allow only 2).
+    out = RiskSizer(MULTI).approve(
+        [_cand("A", 50)], buying_power=100_000, account_value=100_000, open_positions=[])
+    assert len(out) == 1 and out[0].contracts == 3            # 15k / (50*100)
+    off = RiskSizer(SIZING).approve(
+        [_cand("A", 50)], buying_power=100_000, account_value=100_000, open_positions=[])
+    assert off[0].contracts == 2                              # backstop 10% caps at 2 when off
+
+
+def test_multi_csp_ladders_across_strikes_within_the_cap():
+    # liquidity forces 1 contract/rung (floor(500*0.002)=1), so the name's 15% room ladders into a
+    # second strike rather than dumping everything on the top rung.
+    laddering = MULTI.model_copy(update={"max_pct_of_oi": 0.002})
+    out = RiskSizer(laddering).approve(
+        [_cand("A", 50), _cand("A", 30)],
+        buying_power=100_000, account_value=100_000, open_positions=[])
+    assert len(out) == 2 and {a.candidate.underlying for a in out} == {"A"}   # two rungs of A
+    assert sum(a.collateral for a in out) <= 0.15 * 100_000                   # within the 15% cap
+
+
+def test_multi_csp_respects_per_name_cap_total():
+    # three 5k-strike rungs offered; cap allows only 15k total -> 3 contracts, no more.
+    out = RiskSizer(MULTI).approve(
+        [_cand("A", 50), _cand("A", 50), _cand("A", 50)],
+        buying_power=100_000, account_value=100_000, open_positions=[])
+    assert sum(a.contracts for a in out) == 3 and sum(a.collateral for a in out) == 15_000
+
+
+def test_multi_csp_still_no_add_over_time_for_held_names():
+    # a name already held from a prior scan is still skipped (no averaging-in over days).
+    res = RiskSizer(MULTI).evaluate(
+        [_cand("A", 50)], buying_power=100_000, account_value=100_000,
+        open_positions=[_short_put("A", 55)])
+    assert res.approved == []
+    assert any("no add-over-time" in reason and "A" in reason for _c, reason in res.rejected)
+
+
 # --- scale-invariant sizing (target_positions + liquidity cap) -----------------------------------
 
 SCALED = EntrySizing(

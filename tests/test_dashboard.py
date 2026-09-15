@@ -105,6 +105,10 @@ def test_dashboard_endpoints(tmp_path):
 
     stats = client.get("/api/stats").json()
     assert stats["wins"] == 1 and stats["realized_pnl"] == 150.0
+    # /api/stats now carries a windowed this-week block alongside the all-time headline numbers.
+    wk = stats["this_week"]
+    assert set(wk) == {"since", "realized_pnl", "wins", "losses", "resolved_count", "win_rate"}
+    assert wk["resolved_count"] <= stats["resolved_count"]  # window is a subset of all-time
 
     rows = client.get("/api/positions").json()["positions"]
     assert rows[0]["outcome"] == "win" and rows[0]["rule"] == "profit-50"
@@ -129,8 +133,21 @@ def test_dashboard_ships_control_ui(tmp_path):
     page = _bare_app(tmp_path).get("/dashboard").text
     for marker in ('id="wl-in"', 'id="wk-in"', "What you&#39;re holding".replace("&#39;", "'"),
                    "Weekly premium target", "Connected to Robinhood", "TradingView levels",
-                   'id="tv-levels"', "powered by AgenticRobinhood"):
+                   'id="tv-levels"', "powered by AgenticRobinhood",
+                   # Tuning panel: mobile config controls (multi-CSP, gates, per-ticker overrides)
+                   'data-tab="tuning"', 'id="tn-uc"', 'id="tn-em"', 'id="tn-vrp"',
+                   'id="tn-pt-sym"', 'id="tn-pt-save"'):
         assert marker in page, f"missing dashboard marker: {marker!r}"
+
+
+def test_option_oi_fail_open_without_rh_broker(tmp_path):
+    """The OI endpoint degrades safely when Robinhood isn't the broker (e.g. paper): 200 +
+    available=False, never a 500 and never touching a session."""
+    client = _bare_app(tmp_path)
+    r = client.get("/api/option-oi?symbol=SMR")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["symbol"] == "SMR" and j["available"] is False and "reason" in j
 
 
 def test_auth_open_when_no_password(tmp_path, monkeypatch):
