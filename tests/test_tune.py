@@ -127,3 +127,47 @@ def test_normalize_rows_extracts_and_filters():
 def test_report_says_nothing_when_no_proposals():
     md = build_report([], resolved_trades=14, policy=POLICY)
     assert "No changes proposed" in md and "14" in md and "paper trades" in md
+
+
+# --- categorical knob: avoid_setups (technical setups; tightening-only) --------------------------
+
+from agentic.tools.tune import evaluate_setup_avoid, propose_setup_avoid  # noqa: E402
+
+
+def _setup_recs(label, n_lose, n_win_other):
+    recs = [{"realized_pnl": -10.0, "primary_setup": label} for _ in range(n_lose)]
+    recs += [{"realized_pnl": 12.0, "primary_setup": "washout"} for _ in range(n_win_other)]
+    return recs
+
+
+def test_propose_setup_avoid_fires_only_on_losing_bucket_with_evidence():
+    pol = TightenPolicy(mode="shadow", min_n=25)
+    props = propose_setup_avoid(_setup_recs("breakdown", 30, 20), {"avoid_setups": None}, policy=pol)
+    assert len(props) == 1 and props[0].field == "avoid_setups"
+    assert props[0].proposed_value == ["breakdown"] and props[0].evidence["added"] == "breakdown"
+    assert propose_setup_avoid(_setup_recs("breakdown", 10, 20), {"avoid_setups": None}, policy=pol) == []
+    assert propose_setup_avoid(_setup_recs("breakdown", 30, 20), {"avoid_setups": ["breakdown"]}, policy=pol) == []
+    winning = [{"realized_pnl": 5.0, "primary_setup": "coiling"} for _ in range(30)] + _setup_recs("breakdown", 0, 5)
+    assert propose_setup_avoid(winning, {}, policy=pol) == []       # a winning bucket is never proposed
+
+
+def test_evaluate_setup_avoid_guards():
+    pol = TightenPolicy(mode="shadow", min_n=25)
+    ok = TuneProposal("global", "avoid_setups", None, ["breakdown", "support_break"], "primary_setup", "x",
+                      {"excluded": {"n": 30}, "current": ["support_break"], "added": "breakdown"})
+    r = evaluate_setup_avoid(ok, policy=pol)
+    assert r.allowed and r.shadow and not r.would_apply             # shadow: never writes
+    rm = TuneProposal("global", "avoid_setups", None, ["breakdown"], "primary_setup", "x",
+                      {"excluded": {"n": 30}, "current": ["support_break"], "added": "breakdown"})
+    assert any("removes" in m for m in evaluate_setup_avoid(rm, policy=pol).rejections)
+    two = TuneProposal("global", "avoid_setups", None, ["breakdown", "falling_knife"], "primary_setup", "x",
+                       {"excluded": {"n": 30}, "current": [], "added": "breakdown"})
+    assert any("exactly one" in m for m in evaluate_setup_avoid(two, policy=pol).rejections)
+    bad = TuneProposal("global", "avoid_setups", None, ["nonsense"], "primary_setup", "x",
+                       {"excluded": {"n": 30}, "current": []})
+    assert any("known setup labels" in m for m in evaluate_setup_avoid(bad, policy=pol).rejections)
+    low = TuneProposal("global", "avoid_setups", None, ["breakdown"], "primary_setup", "x",
+                       {"excluded": {"n": 5}, "current": []})
+    assert any("min_n" in m for m in evaluate_setup_avoid(low, policy=pol).rejections)
+    num = TuneProposal("global", "min_adx", None, 20.0, "adx", "x", {"excluded": {"n": 30}})
+    assert not evaluate_setup_avoid(num, policy=pol).allowed          # numeric knobs use evaluate_tune

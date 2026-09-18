@@ -81,6 +81,57 @@ class EntryCriteria(BaseModel):
     # actual edge. e.g. 1.1 = IV must be >= 10% above realized. None = off; fail-open when realized vol
     # or the candidate IV is unknown.
     min_iv_rv_ratio: float | None = None
+    # Technical-setup gates (opt-in; None = off; fail-open when no setup read exists for the name).
+    # Labels come from entry/setups.py, classified for a PUT SELLER: FAVORABLE = support tests,
+    # quiet_base, washouts; AVOID = the breakdown family AND the breakout family (measured: breakouts
+    # on these names carry the highest assignment rate); coiling is neutral. The Tuning tab's
+    # "put-seller preset" fills avoid_setups with the breakout family (setups.PUT_SELLER_AVOID_PRESET).
+    avoid_setups: list[str] | None = None     # skip the name if ANY listed label is active
+    require_setups: list[str] | None = None   # enter only if ANY listed label is active
+    # Covered-call assignment clock (opt-in, per ticker via per_ticker). When shares have sat BELOW
+    # cost basis for at least this many days since assignment, the CC pass may sell calls below
+    # basis inside `cc_otm_band` above spot (measured 2026-09: on volatile names the basis floor
+    # trapped capital ~100 days; a 5-10%-OTM call policy turned it in ~35). None = basis floor
+    # always applies (keep it None for quality names -- holding through paid there).
+    cc_below_basis_after_days: int | None = None
+    cc_otm_band: tuple[float, float] = (0.05, 0.10)
+
+
+class SetupConfig(BaseModel):
+    """Thresholds for the deterministic technical-setup detectors (entry/setups.py). Computed every
+    scan from the daily bars already fetched -- cheap -- and journaled with each entry so the
+    analytics flywheel can learn which patterns have edge. Hot-editable under ``entry``."""
+    enabled: bool = True
+    rsi_oversold: float = 30.0
+    bb_len: int = 20
+    bb_std: float = 2.0
+    kc_len: int = 20
+    kc_mult: float = 1.5
+    squeeze_lookback: int = 60           # BB width at its lowest of the trailing N completed bars
+    donchian_len: int = 20
+    vol_avg_len: int = 20
+    breakout_vol_ratio: float = 1.5      # volume vs its 20-day average to CONFIRM a range break
+    anomaly_vol_ratio: float = 2.0       # ... to flag a volume anomaly
+    support_proximity_pct: float = 0.01  # "at support" = within 1% (or the bar pierced it)
+    resistance_proximity_pct: float = 0.03
+    stretch_atr: float = 2.0             # (sma20 - close) / atr >= 2 => stretched below the MA
+    rejection_close_pos: float = 0.6     # close in the top 40% of the bar's range => rejection
+    active_bars: int = 3                 # a setup stays "active" for N completed bars after firing
+    # Candidate labels under validation (reported by the replay; neutral -- not in FAVORABLE/AVOID,
+    # so they change nothing live until the data earns it). See setups.CANDIDATE.
+    strong_vol_ratio: float = 3.0        # breakout_strong: range break on >= 3x volume
+    base_min_bars: int = 15              # breakout_from_base: >= N bars since the last range break
+    base_lookback: int = 60              # how far back to look for that last break
+    climax_max_bars: int = 10            # climax_breakout: an up-break 2..N bars after a prior up-break
+    quiet_base_bars: int = 15            # quiet_base: last N closes within a tight range...
+    quiet_base_range_pct: float = 0.12   # ...(max-min)/close <= 12%, at/near-below the 50-day, quiet volume
+    # Per-ticker risk profile (services/risk_profile.py): computed daily per watchlist name from the
+    # bars the scanner already fetches -- how often a put `profile_base_cushion` expected-moves below
+    # spot got touched / finished ITM over `profile_horizon` bars, and the smallest cushion that keeps
+    # the ITM rate under `target_itm_rate`. Suggestions are tightening-only and applied by the operator.
+    profile_base_cushion: float = 0.7    # ~ the bot's 0.24-delta band
+    profile_horizon: int = 10            # bars held (~ the 7-14 DTE window)
+    target_itm_rate: float = 0.20        # keep historical assignment rate under this
 
 
 class EntrySizing(BaseModel):
@@ -112,6 +163,10 @@ class EntrySizing(BaseModel):
 class EntryConfig(BaseModel):
     enabled: bool = False                      # master off-switch; scanner won't run unless true
     watchlist: list[str] = Field(default_factory=list)
+    # Capital-aware tiers (services/tiers.py): vetted quality names the bot PROPOSES adding once one
+    # contract fits under the per-name cap. ticker -> {"min_collateral": price*100 snapshot,
+    # "note": str, "per_ticker": {...overrides applied on add, e.g. "min_annualized_yield": 0.20}}.
+    watchlist_tiers: dict[str, dict] = Field(default_factory=dict)
     feed: Literal["indicative", "opra"] = "indicative"  # opra (real-time) REQUIRED for live entry
     scan_interval_seconds: int = 300
     # Skip a name whose earnings fall within (dte_max + exclude_earnings_days) days — so a short
@@ -141,6 +196,12 @@ class EntryConfig(BaseModel):
     # When quality_scoring is on, blend the quality score into candidate ranking (higher quality wins
     # among comparable premium). Independent of prefer_iv_rank; both can be on.
     prefer_quality: bool = False
+    # Technical-setup detection (entry/setups.py): always computed + journaled when enabled.
+    # prefer_setups tilts CSP ranking toward favorable setups (washout at support, support tests,
+    # coiling, confirmed breakouts) and away from AVOID reads -- it only REORDERS candidates the
+    # screen and sizer already approved; it never adds any. Off by default.
+    setups: SetupConfig = Field(default_factory=SetupConfig)
+    prefer_setups: bool = False
     # Soft weekly over-trading throttle: once THIS week's collected CSP premium reaches this fraction
     # of account value, further auto-entries are held for one-tap approval instead of firing
     # automatically (not a hard cap). 0 = off. e.g. 0.02 = "auto-trade until ~2%/week, then ask me".
@@ -165,7 +226,9 @@ class RegimeConfig(BaseModel):
     # 20-day realized vol as the fear proxy.
     enabled: bool = True
     symbols: list[str] = Field(default_factory=lambda: ["SPY", "QQQ"])  # [market, tech] proxies
-    lookback_days: int = 220               # daily bars to pull (>=200 for the 200-SMA)
+    lookback_days: int = 330               # CALENDAR days of daily bars to pull; 330 ~ 228 trading bars, so the
+                                           # 200-SMA is always computable (220 gave ~150 bars -> spy_sma200 None,
+                                           # which silently disabled above-200 reads and the downtrend skip)
     elevated_vol: float = 0.20             # SPY annualized realized vol >= -> "elevated" (VIX~20)
     risk_off_vol: float = 0.30             # >= -> "risk_off" (VIX~30)
     # Live VIX thresholds (used when a VIX feed is available; VIX-proper comes from the Robinhood
@@ -179,6 +242,14 @@ class RegimeConfig(BaseModel):
     stock_move_min: float = 0.03           # a stock must be down >= 3% to count as "a move" at all
     hard_gate: bool = False                # true = skip ALL new entries while risk_off (default off:
                                            # flags feed the AI, they don't hard-block)
+    # Confirmed-downtrend skip (opt-in). 2026-09 regime lab, 9 names since 2020: once SPY has closed
+    # below its 200-day for `downtrend_confirm_days` straight sessions, a 0.7-sigma put earned
+    # ~+0.1%/trade vs +0.9% elsewhere (assignments 27%); skipping ONLY those days (crisis regimes
+    # stay open -- they paid best) lifted P&L/trade +0.89% -> +1.00%, PF 1.66 -> 1.80, cut the loss
+    # sum 19%, and turned 2022 from +0.23% to +0.72%/trade. New CSP entries only; open positions,
+    # rolls and covered calls are untouched.
+    skip_confirmed_downtrend: bool = False
+    downtrend_confirm_days: int = 5        # consecutive SPY closes below the 200-day to confirm
 
 
 class AIConfig(BaseModel):
@@ -257,6 +328,22 @@ class WebConfig(BaseModel):
     signal_ttl_seconds: int = 600  # how long a queued TradingView signal stays actionable
 
 
+class TaxReserveConfig(BaseModel):
+    """Weekly sweep of a share of NET realized gains into a cash-equivalent ETF (services/tax_reserve.py).
+    Runs at the ET weekday/time below -- inside regular hours, because share market orders only
+    fill then. Losses carry forward; the bot never sells the reserve; the reserve is walled off
+    from the sizer, the covered-call scanner and assignment detection."""
+    enabled: bool = False
+    pct: float = 0.20
+    symbol: str = "SGOV"
+    weekday: int = 4                 # Friday
+    hour: int = 15
+    minute: int = 40
+    min_order_dollars: float = 5.0   # smaller amounts roll into the next period
+    dry_run: bool = True             # log + ledger the intended order without placing it
+    check_interval_seconds: int = 300
+
+
 class RiskConfig(BaseModel):
     """Portfolio loss circuit breaker for a premium-SELLING book. Freezes NEW entries when realized
     losses pile up — it NEVER force-closes (the monitor keeps managing/closing existing positions,
@@ -312,6 +399,7 @@ class Settings(BaseModel):
     news: NewsConfig = Field(default_factory=NewsConfig)
     roll: RollConfig = Field(default_factory=RollConfig)
     reporting: ReportingConfig = Field(default_factory=ReportingConfig)
+    tax_reserve: TaxReserveConfig = Field(default_factory=TaxReserveConfig)
     notify: NotifyConfig = Field(default_factory=NotifyConfig)
     tunnel: TunnelConfig = Field(default_factory=TunnelConfig)
     web: WebConfig = Field(default_factory=WebConfig)

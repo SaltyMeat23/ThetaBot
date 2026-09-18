@@ -139,6 +139,89 @@ def propose_from_records(
     return out
 
 
+# --- categorical knob: avoid_setups (tightening-only -- it can only ever ADD a label) -------------
+
+CATEGORICAL_FIELDS = frozenset({"avoid_setups"})
+
+
+def _known_setup_labels() -> tuple[str, ...]:
+    from ..entry.setups import ALL_LABELS
+    return ALL_LABELS
+
+
+def _label_stats(records: list[dict], dim: str, label: str, *, match: bool) -> dict:
+    """Win-rate / avg-pnl for records whose categorical `dim` equals (match) / differs from `label`."""
+    n = wins = 0
+    pnl = 0.0
+    for r in records:
+        v, p = r.get(dim), r.get("realized_pnl")
+        if v is None or not _is_num(p):
+            continue
+        if (v == label) != match:
+            continue
+        n += 1
+        pnl += float(p)
+        if float(p) > 0:
+            wins += 1
+    return {"n": n, "win_rate": round(wins / n, 3) if n else None, "avg_pnl": round(pnl / n, 2) if n else None}
+
+
+def propose_setup_avoid(
+    records: list[dict], current_criteria: dict, *, policy: TightenPolicy,
+) -> list[TuneProposal]:
+    """If trades entered while a technical setup was PRIMARY lost (n>=min_n, win_rate<floor,
+    avg_pnl<0) and the rest did better, propose adding that label to ``avoid_setups``. One label per
+    proposal; the proposed list is a strict superset of the current one (tightening only)."""
+    current = list(current_criteria.get("avoid_setups") or [])
+    known = _known_setup_labels()
+    out: list[TuneProposal] = []
+    labels = sorted({r.get("primary_setup") for r in records if r.get("primary_setup")})
+    for label in labels:
+        if label in current or label not in known:
+            continue
+        excl = _label_stats(records, "primary_setup", label, match=True)
+        keep = _label_stats(records, "primary_setup", label, match=False)
+        if excl["n"] < policy.min_n or excl["win_rate"] is None:
+            continue
+        losing = excl["win_rate"] < policy.win_rate_floor and (excl["avg_pnl"] or 0) < 0
+        better = keep["n"] > 0 and keep["win_rate"] is not None and keep["win_rate"] > excl["win_rate"]
+        if not (losing and better):
+            continue
+        out.append(TuneProposal(
+            scope="global", field="avoid_setups", current_value=None,
+            proposed_value=sorted(set(current) | {label}), dimension="primary_setup",
+            reason=(f"primary_setup={label}: {excl['win_rate']*100:.0f}% win, {excl['avg_pnl']} avg "
+                    f"P&L over n={excl['n']} vs others {keep['win_rate']*100:.0f}%/{keep['avg_pnl']}"),
+            evidence={"excluded": excl, "kept": keep, "current": current, "added": label},
+        ))
+    return out
+
+
+def evaluate_setup_avoid(proposal: TuneProposal, *, policy: TightenPolicy) -> GuardResult:
+    """Guards for the categorical avoid_setups knob: known labels only, a strict superset of the
+    current list (never removes a label = never widens), exactly one label added, enough evidence."""
+    rej: list[str] = []
+    shadow = policy.mode != "live"
+    if proposal.field not in CATEGORICAL_FIELDS:
+        rej.append(f"{proposal.field!r} is not a categorical knob")
+        return GuardResult(proposal, allowed=False, shadow=shadow, rejections=rej)
+    v = proposal.proposed_value
+    current = list((proposal.evidence or {}).get("current") or [])
+    known = _known_setup_labels()
+    if not isinstance(v, list) or not v or any(x not in known for x in v):
+        rej.append("proposed value must be a non-empty list of known setup labels")
+    else:
+        if not set(current) <= set(v):
+            rej.append("removes a label from avoid_setups (would widen risk)")
+        added = sorted(set(v) - set(current))
+        if len(added) != 1:
+            rej.append(f"must add exactly one label per proposal (added {added})")
+    n = (proposal.evidence.get("excluded") or {}).get("n", 0)
+    if not isinstance(n, int) or n < policy.min_n:
+        rej.append(f"evidence n={n} below min_n {policy.min_n}")
+    return GuardResult(proposal, allowed=not rej, shadow=shadow, rejections=rej)
+
+
 def evaluate_tune(proposal: TuneProposal, *, policy: TightenPolicy) -> GuardResult:
     """Run every guard. `allowed` reflects a live apply; shadow suppresses the write."""
     rej: list[str] = []
@@ -256,6 +339,8 @@ def normalize_rows(rows: list[dict]) -> list[dict]:
             "bb_percent_b": ctx.get("bb_percent_b"),
             "quality_score": ctx.get("quality_score"),
             "distance_to_support": ctx.get("distance_to_support"),
+            "primary_setup": ctx.get("primary_setup"),   # categorical (entry/setups.py)
+            "setup_bias": ctx.get("setup_bias"),
         })
     return recs
 
@@ -286,6 +371,9 @@ def _main(argv: list[str]) -> int:
     policy = TightenPolicy(mode="shadow", min_n=args.min_n)  # Phase 1: shadow only, never POSTs
     proposals = propose_from_records(records, criteria, policy=policy)
     results = [evaluate_tune(pr, policy=policy) for pr in proposals]
+    # Categorical knob: add a losing technical setup to avoid_setups (superset-only, shadow).
+    for pr in propose_setup_avoid(records, criteria, policy=policy):
+        results.append(evaluate_setup_avoid(pr, policy=policy))
     for r in results:
         append_audit(audit_entry(r), _audit_path())
 

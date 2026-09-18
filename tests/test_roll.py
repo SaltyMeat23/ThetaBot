@@ -169,3 +169,95 @@ async def test_no_credit_roll_notifies_once_per_day(tmp_path):
         assert await rm.try_roll(pos, quote) is False
     assert len(notifier.sent) == 1                  # exactly one alert, not five
     assert "No credit roll" in notifier.sent[0][0]
+
+
+# --- open-leg option_id + half-roll handling (2026-09-17 SOFI incident) ------------------------
+
+class _Caps:
+    is_paper = False
+
+
+class _LiveBroker:
+    """Real-broker stand-in: live orders need an option_id, resolved from the OCC symbol."""
+    def __init__(self, resolved="uuid-16500"):
+        self.resolved = resolved
+        self.asked = []
+
+    def capabilities(self):
+        return _Caps()
+
+    async def resolve_option_id(self, occ):
+        self.asked.append(occ)
+        return self.resolved
+
+
+class _Notes:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, title, message, priority="normal"):
+        self.sent.append((title, message))
+
+
+def _live_settings():
+    return Settings(mode="live", i_understand_live_trading=True, roll=CFG)
+
+
+@pytest.mark.asyncio
+async def test_roll_resolves_option_id_for_the_new_leg(tmp_path):
+    """Alpaca chains carry no Robinhood option_id; the roll must resolve one like the scanner does."""
+    db = Database(tmp_path / "roll4.db")
+    ex, br = _FakeExec(), _LiveBroker("uuid-16500")
+    eds = EntryDecisionStore(db)
+    rm = RollManager(_live_settings(), broker=br, market_data=_MD([_put(17.0, 10, 0.80, -0.25)]),
+                     executor=ex, decisions=DecisionStore(db), entry_decisions=eds,
+                     audit=AuditStore(db), notifier=None)
+    pos = _pos(dte=2, delta=-0.5)
+    q = OptionQuote(occ_symbol=pos.occ_symbol, bid=0.68, ask=0.72, mark=0.70, delta=-0.5)
+    assert await rm.try_roll(pos, q) is True
+    assert br.asked and br.asked[0].endswith("P00017000")
+    ed = eds.recent(5)[0]
+    assert ed.option_id == "uuid-16500" and ed.rule_name == "roll"
+
+
+@pytest.mark.asyncio
+async def test_roll_skips_entirely_when_option_id_unresolvable_live(tmp_path):
+    """No id -> do NOT close the old leg (never half-roll); notify once; the put rides."""
+    db = Database(tmp_path / "roll5.db")
+    ex, notes, audit = _FakeExec(), _Notes(), AuditStore(db)
+    rm = RollManager(_live_settings(), broker=_LiveBroker(resolved=None),
+                     market_data=_MD([_put(17.0, 10, 0.80, -0.25)]), executor=ex,
+                     decisions=DecisionStore(db), entry_decisions=EntryDecisionStore(db),
+                     audit=audit, notifier=notes)
+    pos = _pos(dte=2, delta=-0.5)
+    q = OptionQuote(occ_symbol=pos.occ_symbol, bid=0.68, ask=0.72, mark=0.70, delta=-0.5)
+    assert await rm.try_roll(pos, q) is False
+    assert ex.closed is None and ex.opened is None                 # nothing touched
+    assert len(notes.sent) == 1 and "Roll skipped" in notes.sent[0][0]
+    assert await rm.try_roll(pos, q) is False and len(notes.sent) == 1   # once per day
+    errs = [e for e in audit.recent(20) if e["event_type"] == "ERROR"]
+    assert errs and errs[0]["payload"]["where"] == "roll.resolve"
+
+
+@pytest.mark.asyncio
+async def test_half_roll_is_reported_as_incomplete_not_rolled(tmp_path):
+    """Close filled but the open leg was refused -> return False, audit ERROR, 'INCOMPLETE' notify."""
+    db = Database(tmp_path / "roll6.db")
+
+    class _RefusingExec(_FakeExec):
+        async def execute_open(self, decision, quote):
+            self.opened = decision.occ_symbol
+            return None                                             # executor refused/failed
+
+    ex, notes, audit = _RefusingExec(), _Notes(), AuditStore(db)
+    rm = RollManager(Settings(roll=CFG), broker=None, market_data=_MD([_put(17.0, 10, 0.80, -0.25)]),
+                     executor=ex, decisions=DecisionStore(db), entry_decisions=EntryDecisionStore(db),
+                     audit=audit, notifier=notes)
+    pos = _pos(dte=2, delta=-0.5)
+    q = OptionQuote(occ_symbol=pos.occ_symbol, bid=0.68, ask=0.72, mark=0.70, delta=-0.5)
+    assert await rm.try_roll(pos, q) is False
+    assert ex.closed and ex.opened
+    assert notes.sent and "INCOMPLETE" in notes.sent[0][0]
+    ev = audit.recent(20)
+    assert any(e["event_type"] == "ERROR" and e["payload"].get("where") == "roll.open" for e in ev)
+    assert not any(e["payload"].get("roll") is True for e in ev)      # never audited as a completed roll

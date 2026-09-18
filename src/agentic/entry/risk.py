@@ -192,14 +192,16 @@ class RiskSizer:
         *,
         holdings: list[EquityHolding],
         open_positions: list[Position],
+        exclude: set[str] | None = None,
     ) -> SizingResult:
         """Size covered calls by shares held (no buying power — they're covered), reporting the
-        full disposition.
+        full disposition. ``exclude`` (e.g. the tax-reserve ETF) is never written against.
 
         Sells against uncovered shares only: contracts = shares//100 minus existing short-call
         contracts on that name. One CC candidate per name per scan; respects max_concurrent_cc.
         """
-        shares = {h.symbol: h.quantity for h in holdings}
+        ex = {s.upper() for s in (exclude or set())}
+        shares = {h.symbol: h.quantity for h in holdings if h.symbol.upper() not in ex}
         short_calls: dict[str, int] = {}
         for p in open_positions:
             if p.direction is Direction.SHORT and p.option_type is OptionType.CALL:

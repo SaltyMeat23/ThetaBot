@@ -109,8 +109,56 @@ class RollManager:
             return False
         return await self._execute_roll(position, quote, picked[0], picked[1], reason)
 
+    def _open_needs_option_id(self) -> bool:
+        """Live orders on a real broker are keyed by the option-instrument id; paper isn't."""
+        if not self.settings.is_live or self.broker is None:
+            return False
+        try:
+            return not self.broker.capabilities().is_paper
+        except Exception:  # noqa: BLE001
+            return True
+
+    async def _resolve_target_id(self, target) -> str | None:
+        """The chain that picked ``target`` may come from a different provider than the broker
+        (Alpaca chains carry no Robinhood instrument id), so resolve it the way the scanner does."""
+        if target.option_id:
+            return target.option_id
+        if self.broker is None:
+            return None
+        try:
+            return await self.broker.resolve_option_id(target.occ_symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Roll: option_id lookup failed for %s: %s", target.occ_symbol, exc)
+            return None
+
     async def _execute_roll(self, position, quote, target, net, reason) -> bool:
         now = utcnow()
+        # Resolve the NEW leg's broker id BEFORE touching the old leg. If it can't be resolved the
+        # roll is skipped and the tested put rides (the wheel thesis) -- never buy back the old put
+        # and then fail to sell the new one (2026-09-17: a SOFI roll did exactly that).
+        option_id = await self._resolve_target_id(target)
+        if not option_id and self._open_needs_option_id():
+            marker = CloseDecision(
+                position_id=position.id, rule_name="roll", rule_type=RuleType.ROLL,
+                reason=(f"Roll target {target.occ_symbol} has no broker option_id; skipping the "
+                        f"roll ({reason}) -- leaving it to ride to assignment."),
+                requires_approval=False,
+                dedup_key=f"{dedup_key(position.id, RuleType.ROLL, now)}:noid",
+            )
+            if self.decisions.insert_if_new(marker):
+                self.audit.record(
+                    AuditEventType.ERROR,
+                    {"where": "roll.resolve", "from": position.occ_symbol, "to": target.occ_symbol,
+                     "error": "unresolved option_id"},
+                    source="roll", position_id=position.id,
+                )
+                await self._notify(
+                    f"Roll skipped for {position.underlying} {position.occ_symbol}",
+                    f"Couldn't resolve the broker id for {target.occ_symbol}; leaving the tested "
+                    f"put to ride rather than half-rolling.")
+            log.warning("Roll skipped: no option_id for %s", target.occ_symbol)
+            return False
+
         close_dec = CloseDecision(
             position_id=position.id, rule_name="roll", rule_type=RuleType.ROLL,
             reason=f"Roll: {reason} -> {target.occ_symbol} (net +${net:.2f}).",
@@ -123,18 +171,37 @@ class RollManager:
             return False   # blocked / not filled -> do NOT open the new leg (never go naked-long)
 
         entry_dec = EntryDecision(
-            underlying=position.underlying, occ_symbol=target.occ_symbol, option_id=target.option_id,
+            underlying=position.underlying, occ_symbol=target.occ_symbol, option_id=option_id,
             strike=target.strike, expiration=target.expiration, contracts=position.quantity,
             premium=target.midpoint or 0.0, rule_name="roll",
             reason=f"Roll from {position.occ_symbol} (net +${net:.2f}).",
             dedup_key=f"roll:{target.occ_symbol}:{now.date().isoformat()}",
         )
         self.entry_decisions.insert_if_new(entry_dec)
-        await self.executor.execute_open(entry_dec, target)
+        open_order = await self.executor.execute_open(entry_dec, target)
+        if open_order is None or open_order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
+            # HALF-ROLLED: the tested put is closed but the new leg was refused. Say so loudly --
+            # this is not a completed roll and must not be reported as one.
+            self.audit.record(
+                AuditEventType.ERROR,
+                {"where": "roll.open", "from": position.occ_symbol, "to": target.occ_symbol,
+                 "closed": True, "opened": False,
+                 "open_status": (open_order.status.value if open_order is not None else None)},
+                source="roll", position_id=position.id,
+            )
+            await self._notify(
+                f"Roll INCOMPLETE for {position.underlying}",
+                f"Closed {position.occ_symbol} but the new leg {target.occ_symbol} was not "
+                f"opened ({'refused' if open_order is None else open_order.status.value}). "
+                f"{position.underlying} is now flat; the scanner may re-enter on its own rules.")
+            log.error("Roll INCOMPLETE %s -> %s: closed but open leg not placed",
+                      position.occ_symbol, target.occ_symbol)
+            return False
 
         self.audit.record(
             AuditEventType.DECISION,
-            {"roll": True, "from": position.occ_symbol, "to": target.occ_symbol, "net_credit": net},
+            {"roll": True, "from": position.occ_symbol, "to": target.occ_symbol, "net_credit": net,
+             "open_status": open_order.status.value},
             source="roll", position_id=position.id,
         )
         await self._notify(

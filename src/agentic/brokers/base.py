@@ -20,6 +20,7 @@ class BrokerCapabilities:
     supports_options_orders: bool
     is_paper: bool
     notes: str = ""
+    supports_equity_orders: bool = False   # share BUY orders (tax-reserve sweep); never sells
 
 
 class ExecutionBroker(ABC):
@@ -67,6 +68,16 @@ class ExecutionBroker(ABC):
         """Resolve an OCC symbol to this broker's option-instrument id (for opening a new
         contract we don't already hold). Default: unknown."""
         return None
+
+    async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
+                                  quantity: float | None = None, order_type: str = "market",
+                                  ref_id: str | None = None, price_hint: float | None = None) -> dict:
+        """Place a SHARE order (used only to BUY the tax reserve). Returns
+        ``{order_id, status, shares, avg_price, dollars}``. Default: unsupported."""
+        raise NotImplementedError("This broker does not place share orders.")
+
+    async def get_equity_order(self, order_id: str) -> dict:
+        raise NotImplementedError("This broker does not read share orders.")
 
     async def submit_open_order(self, order: Order) -> Order:
         """Submit a sell-to-open order (CSP). Idempotent on order.client_order_id."""

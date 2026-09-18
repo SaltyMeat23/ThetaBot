@@ -10,6 +10,7 @@ The fake positions can be overridden by passing ``seed_positions`` (e.g. from a 
 from __future__ import annotations
 
 import json
+import uuid
 import logging
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -161,6 +162,33 @@ class PaperBroker(ExecutionBroker):
     async def get_equity_positions(self) -> list[EquityHolding]:
         return list(self._holdings)
 
+    async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
+                                  quantity: float | None = None, order_type: str = "market",
+                                  ref_id: str | None = None, price_hint: float | None = None) -> dict[str, Any]:
+        """Simulated market BUY by dollar amount: fills at ``price_hint`` (or the last known price,
+        else $100), fractional shares, merged into holdings at a weighted average cost."""
+        if side != "buy" or not dollar_amount or dollar_amount <= 0:
+            raise RuntimeError("paper submit_equity_order only supports market BUY by dollar amount.")
+        price = float(price_hint or getattr(self, "_last_prices", {}).get(symbol.upper()) or 100.0)
+        shares = round(float(dollar_amount) / price, 6)
+        sym = symbol.upper()
+        for h in self._holdings:
+            if h.symbol.upper() == sym:
+                total = h.quantity + shares
+                h.average_cost = round((h.average_cost * h.quantity + price * shares) / total, 4) if total else price
+                h.quantity = total
+                break
+        else:
+            self._holdings.append(EquityHolding(symbol=sym, quantity=shares, average_cost=price))
+        self._buying_power -= float(dollar_amount)
+        self._save()
+        oid = ref_id or uuid.uuid4().hex
+        return {"order_id": oid, "status": "filled", "shares": shares, "avg_price": price,
+                "dollars": round(float(dollar_amount), 2), "raw_state": "filled"}
+
+    async def get_equity_order(self, order_id: str) -> dict[str, Any]:
+        return {"order_id": order_id, "status": "filled", "raw_state": "filled"}
+
     async def connect(self) -> None:
         return None
 
@@ -169,6 +197,7 @@ class PaperBroker(ExecutionBroker):
             name="paper",
             supports_options_orders=True,
             is_paper=True,
+            supports_equity_orders=True,
             notes="Simulated broker; no real orders.",
         )
 

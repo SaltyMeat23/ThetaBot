@@ -29,6 +29,33 @@ class UnderlyingContext:
     # Company quality/growth score (0-100), overlaid post-build by the scanner from the company-data
     # provider. None = no company data / gate off. See scoring/quality.py.
     quality_score: float | None = None
+    # Technical-setup read (entry/setups.py), overlaid by the scanner from the daily bars. Labels
+    # are journaled with every entry (so the flywheel learns which patterns have edge), feed the
+    # opt-in avoid_setups/require_setups gates and the prefer_setups tilt, and reach the AI
+    # reviewer via as_dict(). None = no read (too little history / detection off) -> gates skip.
+    setups: list[str] | None = None            # ACTIVE composite labels (PRIORITY-ordered)
+    primary_setup: str | None = None
+    setup_bias: str | None = None              # favorable | avoid | mixed | none
+    setup_score: int | None = None
+    setups_fired_now: list[str] | None = None  # labels true on the last COMPLETED bar
+    bb_width_pct: float | None = None
+    bb_squeeze: bool | None = None
+    ttm_squeeze: bool | None = None
+    donchian_high_20: float | None = None
+    donchian_low_20: float | None = None
+    vol_ratio_20: float | None = None
+    support_ref: float | None = None           # the level used ("tv" if fresh, else Donchian low)
+    support_source: str | None = None
+    dist_to_support_pct: float | None = None
+    resistance_ref: float | None = None
+    dist_to_resistance_pct: float | None = None
+    live_breakout_attempt: bool | None = None  # today's PARTIAL bar breaking the range right now
+    live_breakdown_attempt: bool | None = None
+    # TradingView real-time layer (setups.parse_tv_setups / merge_tv): fresh flags from the Daily +
+    # intraday exporters, merged (union) into the fields above; provenance in setup_sources.
+    tv_setups: dict | None = None
+    tv_bar_age_seconds: float | None = None
+    setup_sources: list[str] | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -58,6 +85,9 @@ def build_context(
         atr=indicators.atr(highs, lows, closes, 14),
         iv_rank=indicators.iv_rank(atm_iv, iv_history, criteria.iv_rank_min_history_days),
         drawdown_20d=_drawdown(closes, 20),
+        # Bot-computed Bollinger %B (same 0-100 definition as the TradingView field; a fresh TV
+        # value still overwrites it). Makes the opt-in min_bb_percent_b gate live without TV.
+        bb_percent_b=indicators.bb_percent_b(closes),
     )
 
 
@@ -87,4 +117,14 @@ def passes_underlying_gates(ctx: UnderlyingContext, criteria: EntryCriteria) -> 
     if (criteria.min_quality_score is not None and ctx.quality_score is not None
             and ctx.quality_score < criteria.min_quality_score):
         return f"quality {ctx.quality_score:.0f} < {criteria.min_quality_score:.0f} (low quality/growth)"
+    # Technical-setup gates: skip a name while an AVOID pattern is active (e.g. a fresh breakdown --
+    # do not sell puts into it), or require a favorable one. Both skip when there is no read.
+    if criteria.avoid_setups and ctx.setups is not None:
+        hit = [s for s in ctx.setups if s in criteria.avoid_setups]
+        if hit:
+            return f"setup {hit[0]} active (avoid_setups)"
+    if criteria.require_setups and ctx.setups is not None:
+        if not any(s in criteria.require_setups for s in ctx.setups):
+            have = ", ".join(ctx.setups) if ctx.setups else "none"
+            return f"no required setup active (have: {have})"
     return None

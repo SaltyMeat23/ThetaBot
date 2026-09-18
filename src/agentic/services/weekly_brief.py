@@ -73,6 +73,11 @@ def _backdrop(regime: dict | None) -> list[str]:
     spy = "above" if regime.get("spy_above_sma200") else "below"
     qqq = "above" if regime.get("qqq_above_sma200") else "below"
     lines.append(f"- SPY {spy} 200-SMA | QQQ {qqq} 200-SMA")
+    dbl = regime.get("spy_days_below_sma200")
+    if isinstance(dbl, int) and dbl > 0:
+        lines.append(f"- SPY has closed below its 200-day for {dbl} session{'s' if dbl != 1 else ''}"
+                     + (" -- **confirmed downtrend** (new puts paused if the skip is on)"
+                        if regime.get("confirmed_downtrend") else ""))
     dd = regime.get("spy_drawdown_20d")
     if _num(dd):
         lines.append(f"- SPY 20-day drawdown: {dd * 100:+.1f}%")
@@ -99,6 +104,33 @@ def _catalysts(watchlist, contexts, econ_events) -> list[str]:
         lines += [f"- {sym}: in ~{dte}d" for dte, sym in earns]
     else:
         lines.append("**Earnings:** none within ~2 weeks on the watchlist.")
+    lines.append("")
+    return lines
+
+
+def _setups_firing(watchlist, contexts) -> list[str]:
+    """Which names have a technical setup active, grouped by what it means for a premium seller."""
+    fav: list[str] = []
+    avoid: list[str] = []
+    for sym in watchlist:
+        ctx = contexts.get(sym) or {}
+        labels = ctx.get("setups") or []
+        if not labels:
+            continue
+        entry = f"{sym}: {', '.join(labels)}"
+        (avoid if ctx.get("setup_bias") in ("avoid", "mixed") else fav).append(entry)
+    lines = ["## Setups firing", "",
+             "_Deterministic daily-bar pattern reads (washout / coiling / breakout / breakdown / "
+             "support tests) - what is happening structurally, not a recommendation._", ""]
+    if not fav and not avoid:
+        lines += ["- No setups active on the watchlist.", ""]
+        return lines
+    if fav:
+        lines.append("**Favorable for a premium seller:**")
+        lines += [f"- {e}" for e in fav]
+    if avoid:
+        lines.append("**Caution (avoid selling puts into):**")
+        lines += [f"- {e}" for e in avoid]
     lines.append("")
     return lines
 
@@ -143,6 +175,24 @@ def _watchlist(watchlist, contexts, cand_by_u, tv_by_symbol, news_by_symbol) -> 
         qs = ctx.get("quality_score")
         if _num(qs):
             lines.append(f"- **Quality score:** {qs:.0f}/100")
+        setups = ctx.get("setups") or []
+        if setups:
+            bias = ctx.get("setup_bias")
+            bits = []
+            if _num(ctx.get("rsi")):
+                bits.append(f"RSI {ctx['rsi']:.0f}")
+            dsp, sref = ctx.get("dist_to_support_pct"), ctx.get("support_ref")
+            if _num(dsp) and _num(sref):
+                bits.append(f"{dsp:+.1f}% vs support {sref:g}")
+            vr = ctx.get("vol_ratio_20")
+            bits.append(f"vol {vr:.1f}x" if _num(vr) else "vol n/a")
+            tag = "AVOID: " if bias == "avoid" else ("MIXED: " if bias == "mixed" else "")
+            live = ""
+            if ctx.get("live_breakout_attempt"):
+                live = " (breakout attempt on today's partial bar)"
+            elif ctx.get("live_breakdown_attempt"):
+                live = " (breakdown attempt on today's partial bar)"
+            lines.append(f"- **Setup:** {tag}{', '.join(setups)} ({'; '.join(bits)}){live}")
         dte = ctx.get("days_to_earnings")
         cand_dte = cand.get("dte") if cand else None
         if earnings_before_expiry(dte, cand_dte) is True:
@@ -190,6 +240,32 @@ def _management(open_positions, contexts, total_buying_power) -> list[str]:
     return lines
 
 
+def _reserve_and_unlocks(tax_reserve: dict | None, tier_proposals: list[dict] | None) -> list[str]:
+    """Tax reserve state + quality names that now fit the per-name cap (proposals, never auto-added)."""
+    out: list[str] = []
+    tr = tax_reserve or {}
+    cfg = tr.get("config") or {}
+    if cfg.get("enabled"):
+        h, t, st = tr.get("holding") or {}, tr.get("totals") or {}, tr.get("status") or {}
+        out += ["## Tax reserve", "",
+                f"- Held: **${(h.get('value') or 0):,.2f}** in {cfg.get('symbol', 'SGOV')}"
+                + (f" ({h.get('shares'):,.4f} sh)" if h.get("shares") else "")
+                + " -- walled off from trading capital",
+                f"- Swept to date: ${(t.get('swept_dollars') or 0):,.2f} over {t.get('sweeps', 0)} sweep(s); "
+                f"net realized since the last sweep {(st.get('pending_net_since_last') or 0):+,.2f} "
+                f"-> next sweep would buy ${(st.get('would_sweep') or 0):,.2f}"
+                + (" (DRY RUN)" if cfg.get("dry_run") else ""), ""]
+    if tier_proposals:
+        out += ["## Capital unlocks", "",
+                "_Quality names whose one-contract collateral now fits under the per-name cap. "
+                "Proposal only -- add from the Tuning tab._", ""]
+        for r in tier_proposals[:8]:
+            out.append(f"- **{r['symbol']}**: ${r['collateral']:,.0f} per contract vs cap ${r['per_name_cap']:,.0f}"
+                       + (f" -- {r['note']}" if r.get("note") else ""))
+        out.append("")
+    return out
+
+
 def _portfolio(accounts) -> list[str]:
     lines = ["## Broader portfolio", "",
              "_Advisory 'what you could sell' across your accounts - read-only, not a recommendation._", ""]
@@ -225,6 +301,7 @@ def build_weekly_brief(
     tv_by_symbol: dict[str, dict], regime: dict | None, news_by_symbol: dict[str, str],
     accounts: list[dict], econ_events: list, now: datetime, ai_analysis: str | None = None,
     open_positions: list | None = None, total_buying_power: float | None = None,
+    tax_reserve: dict | None = None, tier_proposals: list[dict] | None = None,
 ) -> tuple[str, str]:
     """Return (title, markdown). Descriptive/informational only. ``ai_analysis`` is an optional
     Claude-written tactical synthesis rendered up top (fail-open — omitted when unavailable).
@@ -241,7 +318,9 @@ def build_weekly_brief(
                  "not advice._", "", ai_analysis, ""]
     body += _backdrop(regime)
     body += _catalysts(watchlist, contexts, econ_events)
+    body += _setups_firing(watchlist, contexts)
     body += _watchlist(watchlist, contexts, _by_underlying(candidates), tv_by_symbol, news_by_symbol)
     body += _management(open_positions, contexts, total_buying_power)
+    body += _reserve_and_unlocks(tax_reserve, tier_proposals)
     body += _portfolio(accounts)
     return title, "\n".join(body)

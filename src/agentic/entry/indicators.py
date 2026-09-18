@@ -68,3 +68,103 @@ def iv_rank(current_iv: float | None, history: list[float], min_days: int = 60) 
     if hi <= lo:
         return None
     return round((current_iv - lo) / (hi - lo) * 100, 1)
+
+
+# --- setup-detection helpers (pure; None on insufficient data) ----------------------------------
+
+def ema(values: list[float], n: int) -> float | None:
+    """Exponential moving average, seeded with the SMA of the first n values."""
+    if n <= 0 or len(values) < n:
+        return None
+    k = 2.0 / (n + 1)
+    e = sum(values[:n]) / n
+    for v in values[n:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def stdev(values: list[float], n: int) -> float | None:
+    """Population standard deviation of the last n values."""
+    if n <= 1 or len(values) < n:
+        return None
+    return statistics.pstdev(values[-n:])
+
+
+def bollinger(closes: list[float], n: int = 20, k: float = 2.0) -> tuple[float, float, float] | None:
+    """(lower, mid, upper) Bollinger Bands: SMA(n) +/- k * population stdev(n)."""
+    mid, sd = sma(closes, n), stdev(closes, n)
+    if mid is None or sd is None:
+        return None
+    return (mid - k * sd, mid, mid + k * sd)
+
+
+def bb_percent_b(closes: list[float], n: int = 20, k: float = 2.0) -> float | None:
+    """Bollinger %B on a 0-100 scale (matches the TradingView feed field): 0 = at the lower band,
+    100 = at the upper band. None when the bands collapse to zero width."""
+    bb = bollinger(closes, n, k)
+    if bb is None:
+        return None
+    lo, _mid, hi = bb
+    width = hi - lo
+    if width <= 0:
+        return None
+    return round((closes[-1] - lo) / width * 100, 2)
+
+
+def bb_width_pct(closes: list[float], n: int = 20, k: float = 2.0) -> float | None:
+    """Bollinger band width as a % of the middle band: (upper - lower) / mid * 100."""
+    bb = bollinger(closes, n, k)
+    if bb is None:
+        return None
+    lo, mid, hi = bb
+    if mid <= 0:
+        return None
+    return round((hi - lo) / mid * 100, 4)
+
+
+def bb_width_series(closes: list[float], n: int = 20, k: float = 2.0,
+                    lookback: int = 60) -> list[float]:
+    """Trailing Bollinger widths (oldest -> newest), one per bar over the last ``lookback`` bars
+    that have a full n-window; the LAST element is the current bar's width. Lets a caller test
+    'width at its lowest of the trailing window' (a volatility squeeze) against the PRIOR widths."""
+    out: list[float] = []
+    start = max(n, len(closes) - lookback)
+    for end in range(start, len(closes) + 1):
+        w = bb_width_pct(closes[:end], n, k)
+        if w is not None:
+            out.append(w)
+    return out
+
+
+def keltner(highs: list[float], lows: list[float], closes: list[float], n: int = 20,
+            mult: float = 1.5) -> tuple[float, float, float] | None:
+    """(lower, mid, upper) Keltner Channel: EMA(n) of closes +/- mult * ATR(n)."""
+    mid, a = ema(closes, n), atr(highs, lows, closes, n)
+    if mid is None or a is None:
+        return None
+    return (mid - mult * a, mid, mid + mult * a)
+
+
+def donchian(highs: list[float], lows: list[float], n: int = 20,
+             exclude_last: bool = True) -> tuple[float, float] | None:
+    """(low, high) Donchian channel over the prior n bars. With ``exclude_last`` (default) the
+    LAST bar is left out, so a breakout test compares a bar against the range it did NOT help
+    form -- no look-ahead."""
+    hs = highs[:-1] if exclude_last else highs
+    ls = lows[:-1] if exclude_last else lows
+    if n <= 0 or len(hs) < n or len(ls) < n:
+        return None
+    return (min(ls[-n:]), max(hs[-n:]))
+
+
+def volume_ratio(volumes: list, n: int = 20) -> float | None:
+    """Last bar's volume / mean volume of the prior n bars. None when the last volume or ANY prior
+    volume is missing/non-positive (e.g. a provider that omits volume) -- callers must treat that as
+    'unknown', never as 'no spike'."""
+    if n <= 0 or len(volumes) < n + 1:
+        return None
+    last, prior = volumes[-1], volumes[-(n + 1):-1]
+    if last is None or last <= 0 or any(v is None or v <= 0 for v in prior):
+        return None
+    avg = sum(prior) / n
+    return round(last / avg, 3) if avg > 0 else None

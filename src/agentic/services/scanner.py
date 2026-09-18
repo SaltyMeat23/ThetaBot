@@ -32,6 +32,10 @@ from ..entry.context import UnderlyingContext, build_context, passes_underlying_
 from ..entry.regime import MarketRegime, build_market_regime, classify_move
 from ..entry.risk import RiskSizer
 from ..entry.screener import EntryCandidate, passes_candidate_gates, screen_candidates
+from ..entry.setups import (
+    MIN_BARS, compose, detect_flags, detect_setups, merge_tv, parse_tv_setups, primary_setup,
+    setup_bias, setup_score, setup_sort_key,
+)
 from ..marketdata.earnings import NullEarningsProvider, earnings_blackout
 from ..marketdata.company_data import NullCompanyDataProvider
 from ..scoring.quality import quality_breakdown
@@ -81,7 +85,9 @@ class OpportunityScanner:
         entry_candidates=None,      # store.entry_candidates.EntryCandidateStore | None
         news_provider=None,         # marketdata.news.NewsProvider | None (pull)
         news=None,                  # store.news.NewsStore | None
+        setup_events=None,          # store.setup_events.SetupEventStore | None (setup-accuracy tracker)
     ):
+        self.setup_events = setup_events
         self.settings = settings
         self.broker = broker
         self.market_data = market_data
@@ -111,6 +117,65 @@ class OpportunityScanner:
         self.last_scan_at = None
         self.last_regime: MarketRegime | None = None          # market-wide regime snapshot
         self.last_breaker: dict | None = None                 # loss circuit breaker state (freezes new entries)
+        self.last_setups: dict[str, dict] = {}                # per-symbol technical setup read (for /api/setups)
+        self.last_risk_profile: dict[str, dict] = {}          # per-symbol strike-survival profile (daily)
+        self.last_reserve: dict | None = None                 # tax-reserve holding (walled off from sizing)
+        self.last_tier_proposals: list[dict] = []             # quality names the account can now afford
+        self.last_cc_clock: dict[str, dict] = {}              # per held name: days since assignment, below-basis allowed
+        self.tax_reserve_store = None                         # set by main.py (ledger; for the dashboard)
+        self._tiers_computed_on: str | None = None
+        self._tier_prices: dict[str, float] = {}
+        self.last_account_value: float | None = None
+
+    async def _reserve_value(self, holdings, reserve: set[str]) -> float:
+        """Market value of the tax-reserve holding (0 when none). Price read is best-effort; falls
+        back to cost basis so the reserve is ALWAYS netted out even without a quote."""
+        held = [h for h in holdings if h.symbol.upper() in reserve]
+        if not held:
+            self.last_reserve = None
+            return 0.0
+        h = held[0]
+        price = None
+        try:
+            price = await self.market_data.get_underlying_price(h.symbol)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("reserve price read failed for %s: %s", h.symbol, exc)
+        px = float(price) if price else float(h.average_cost or 0.0)
+        value = round(px * float(h.quantity), 2)
+        self.last_reserve = {"symbol": h.symbol, "shares": float(h.quantity), "price": px,
+                             "avg_cost": float(h.average_cost or 0.0), "value": value,
+                             "as_of": utcnow().isoformat()}
+        return value
+
+    async def _refresh_tiers(self, account_value: float) -> None:
+        """Once a day: which vetted quality names now fit under the per-name cap (proposal only)."""
+        cfg = self.settings.entry
+        if not cfg.watchlist_tiers:
+            self.last_tier_proposals = []
+            return
+        today = utcnow().date().isoformat()
+        if self._tiers_computed_on == today:
+            return
+        from .tiers import ready_to_add
+        prices: dict[str, float] = {}
+        for sym in cfg.watchlist_tiers:
+            if sym.upper() in {w.upper() for w in cfg.watchlist}:
+                continue
+            try:
+                p = await self.market_data.get_underlying_price(sym)
+                if p:
+                    prices[sym.upper()] = float(p)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("tier price read failed for %s: %s", sym, exc)
+        self._tier_prices = prices
+        s = cfg.sizing
+        self.last_tier_proposals = ready_to_add(
+            cfg.watchlist_tiers, cfg.watchlist, account_value, s.max_pct_per_underlying, prices,
+            backstop_pct=s.max_position_size_pct)
+        self._tiers_computed_on = today
+        if self.last_tier_proposals:
+            log.info("Capital unlocks: %s now fit under the per-name cap (proposal only).",
+                     ", ".join(r["symbol"] for r in self.last_tier_proposals))
 
     async def _compute_regime(self) -> MarketRegime | None:
         """Best-effort market-regime snapshot from index-ETF daily bars. Never raises (advisory)."""
@@ -185,6 +250,17 @@ class OpportunityScanner:
         holdings = await self.broker.get_equity_positions()
         self.last_holdings = holdings
 
+        # Tax reserve is walled off: its value never counts as capital for sizing, the breaker or
+        # the sector cap, and its shares are never written against or read as an assignment.
+        from .holdings import reserve_symbols, tradable_holdings
+        reserve = reserve_symbols(self.settings)
+        holdings_tradable = tradable_holdings(holdings, reserve)
+        reserve_val = await self._reserve_value(holdings, reserve)
+        buying_power = max(0.0, buying_power - reserve_val)
+        account_value = max(0.0, account_value - reserve_val)
+        self.last_account_value = account_value
+        await self._refresh_tiers(account_value)
+
         # Market-regime read (systemic-vs-idiosyncratic context for the AI reviewer / optional gate).
         if self.settings.macro.enabled:
             self.last_regime = await self._compute_regime()
@@ -248,13 +324,15 @@ class OpportunityScanner:
             cands = passed
             csp_cands.extend(cands)
         if cfg.prefer_quality:
-            csp_cands.sort(
-                key=lambda c: quality_sort_key(c, context_by_underlying, cfg.prefer_iv_rank),
-                reverse=True)
+            inner = lambda c: quality_sort_key(c, context_by_underlying, cfg.prefer_iv_rank)  # noqa: E731
         elif cfg.prefer_iv_rank:
-            csp_cands.sort(key=lambda c: iv_rank_sort_key(c, context_by_underlying), reverse=True)
+            inner = lambda c: iv_rank_sort_key(c, context_by_underlying)  # noqa: E731
         else:
-            csp_cands.sort(key=lambda x: x.theta_efficiency, reverse=True)  # decay-per-collateral
+            inner = lambda c: (float(c.theta_efficiency),)  # noqa: E731 -- decay-per-collateral
+        # prefer_setups: favorable technical setups first, AVOID reads last, the inner key breaks
+        # ties. It only REORDERS -- the screen and the sizer still decide what is eligible.
+        key = (lambda c: setup_sort_key(c, context_by_underlying, inner)) if cfg.prefer_setups else inner
+        csp_cands.sort(key=key, reverse=True)
         self.last_candidates = csp_cands
         csp_result = self.sizer.evaluate(
             csp_cands, buying_power=buying_power, account_value=account_value,
@@ -277,6 +355,21 @@ class OpportunityScanner:
             )
             csp_approved = []
 
+        # Confirmed-downtrend skip (opt-in): no NEW short puts while SPY has closed below its
+        # 200-day for N straight sessions. Crisis/risk_off is deliberately NOT part of this gate --
+        # measured, those days paid best; the quiet grind below the 200-day is the one that didn't.
+        mac = self.settings.macro
+        reg = self.last_regime
+        if (mac.enabled and mac.skip_confirmed_downtrend and reg is not None
+                and reg.confirmed_downtrend):
+            reason = (f"market: SPY below its 200-day for {reg.spy_days_below_sma200} sessions "
+                      f"(confirmed downtrend >= {mac.downtrend_confirm_days}d) -- new puts paused")
+            if csp_approved:
+                log.info("Confirmed downtrend: suppressing %d CSP entr(ies).", len(csp_approved))
+            skips.append({"symbol": "*", "reason": reason})
+            csp_rejected.extend((e.candidate, reason) for e in csp_approved)
+            csp_approved = []
+
         # Correlation / sector concentration cap (opt-in): veto approved CSPs that would push one
         # sector over its share of the account — so a many-name book can't become one correlated bet.
         if self.settings.risk.max_pct_per_sector and csp_approved:
@@ -290,23 +383,41 @@ class OpportunityScanner:
             csp_approved = kept
 
         # CC pass — covered calls on shares held (strike floored at cost basis), per-ticker criteria.
+        # Assignment clock (opt-in per ticker): shares under water for >= N days since assignment may
+        # be written against BELOW basis, inside the configured OTM band above spot, so capital
+        # turns over instead of sitting (measured: ~35 days vs ~100 with the basis floor).
+        from .holdings import below_basis_allowed
         cc_cands: list[EntryCandidate] = []
-        for h in holdings:
+        journal_rows = self.trade_journal.recent(500) if self.trade_journal is not None else []
+        self.last_cc_clock = {}
+        for h in holdings_tradable:
             if h.quantity < 100:
                 continue
             crit = cfg.criteria_for(h.symbol, cfg.cc_criteria)
             chain = await chain_for(h.symbol)
             if h.symbol not in context_by_underlying:
                 context_by_underlying[h.symbol] = await self._context_for(h.symbol, chain, crit)
-            cc_cands.extend(screen_candidates(
-                h.symbol, chain, crit, option_type="call", strike_floor=h.average_cost,
-            ))
+            px = getattr(context_by_underlying.get(h.symbol), "price", None)
+            allowed, days = below_basis_allowed(h, crit, journal_rows, utcnow(), px)
+            self.last_cc_clock[h.symbol] = {"days_held": days, "below_basis_allowed": allowed,
+                                            "under_water": (px is not None and px < h.average_cost),
+                                            "clock_days": crit.cc_below_basis_after_days}
+            if allowed and px:
+                lo, hi = crit.cc_otm_band
+                cc_cands.extend(screen_candidates(
+                    h.symbol, chain, crit, option_type="call", strike_floor=px * (1 + lo),
+                    strike_ceiling=px * (1 + hi), ignore_delta=True,
+                ))
+            else:
+                cc_cands.extend(screen_candidates(
+                    h.symbol, chain, crit, option_type="call", strike_floor=h.average_cost,
+                ))
         cc_cands.sort(key=lambda x: x.theta_efficiency, reverse=True)
         self.last_cc_candidates = cc_cands
         self.last_context = context_by_underlying
         self.last_skips = skips
         cc_result = self.sizer.evaluate_covered_calls(
-            cc_cands, holdings=holdings, open_positions=open_positions,
+            cc_cands, holdings=holdings_tradable, open_positions=open_positions, exclude=reserve,
         )
         cc_approved = cc_result.approved
         self.last_scan_at = utcnow()
@@ -544,6 +655,119 @@ class OpportunityScanner:
             v = payload.get(field)
             if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
                 setattr(ctx, field, float(v))
+        # TradingView setup flags (real-time layer): numerics only (0/1 for booleans; JSON true/false
+        # is rejected), freshness keyed on the PAYLOAD bar time -- every alert bumps the merged
+        # snapshot's received_at, so stale keys linger there -- then merged (union) with the bot's read.
+        try:
+            tv_setups, age = parse_tv_setups(payload, now_ms=int(utcnow().timestamp() * 1000))
+            if tv_setups:
+                ctx.tv_setups, ctx.tv_bar_age_seconds = tv_setups, age
+                self._merge_tv_setups(underlying, ctx, tv_setups)
+        except Exception as exc:  # noqa: BLE001 -- advisory overlay; never break a scan
+            log.warning("TV setup overlay failed for %s: %s", underlying, exc)
+
+    def _merge_tv_setups(self, symbol: str, ctx: UnderlyingContext, tv: dict) -> None:
+        """Union fresh TradingView setup flags into the context (and the cached read the Setups
+        panel serves). TV can add/upgrade labels and set the live *_attempt flags; it never removes
+        what the bot detected."""
+        cached = self.last_setups.get(symbol)
+        live = dict((cached or {}).get("live") or {})
+        setups, live, sources = merge_tv(ctx.setups, live, tv,
+                                         breakout_vol_ratio=self.settings.entry.setups.breakout_vol_ratio)
+        ctx.setups = setups
+        ctx.primary_setup, ctx.setup_bias, ctx.setup_score = primary_setup(setups), setup_bias(setups), setup_score(setups)
+        ctx.live_breakout_attempt = live.get("breakout_attempt")
+        ctx.live_breakdown_attempt = live.get("breakdown_attempt")
+        ctx.setup_sources = sources or None
+        tv_block = {"present": True, "bar_age_seconds": ctx.tv_bar_age_seconds, "flags": tv,
+                    "sources": sources}
+        if cached is None:
+            cached = {"flags": {}, "features": {}, "fired_now": [], "partial_bar": None}
+            self.last_setups[symbol] = cached
+        cached.update({"setups": setups, "live": live, "bias": ctx.setup_bias,
+                       "score": ctx.setup_score, "primary": ctx.primary_setup, "tv": tv_block})
+
+    def _refresh_risk_profile(self, symbol: str, bars: list[dict]) -> None:
+        """Once per day per name: the strike-survival risk profile from the bars already fetched
+        (~1y), so every watchlist name -- including a fresh add -- is profiled on its first scan.
+        Advisory; failures leave the previous profile in place."""
+        cfg = self.settings.entry.setups
+        today = utcnow().date().isoformat()
+        cur = self.last_risk_profile.get(symbol)
+        if cur is not None and cur.get("date") == today:
+            return
+        try:
+            from .risk_profile import ticker_risk_profile
+            prof = ticker_risk_profile(bars, base_cushion=cfg.profile_base_cushion,
+                                       horizon=cfg.profile_horizon, target_itm=cfg.target_itm_rate)
+            prof["date"], prof["symbol"] = today, symbol
+            self.last_risk_profile[symbol] = prof
+        except Exception as exc:  # noqa: BLE001 -- advisory
+            log.warning("risk profile failed for %s: %s", symbol, exc)
+
+    def _tv_levels(self, underlying: str) -> tuple[float | None, float | None]:
+        """Fresh TradingView support/resistance for a name (None when absent, stale, or invalid)."""
+        if self.tv_indicators is None:
+            return None, None
+        snap = self.tv_indicators.get_latest(
+            underlying, self.settings.ai.tv_indicator_max_age_seconds)
+        pay = snap.get("payload", {}) if snap else {}
+        out: list[float | None] = []
+        for k in ("support", "resistance"):
+            v = pay.get(k)
+            ok = (isinstance(v, (int, float)) and not isinstance(v, bool)
+                  and math.isfinite(v) and v > 0)
+            out.append(float(v) if ok else None)
+        return out[0], out[1]
+
+    def _overlay_setups(self, symbol: str, ctx: UnderlyingContext, bars: list[dict]) -> None:
+        """Run the deterministic technical-setup detectors on the bars already fetched and overlay
+        the read onto the context: it is journaled with every entry, feeds the opt-in setup gates
+        and the prefer_setups tilt, and reaches the AI reviewer. Advisory -- any failure leaves the
+        fields None and never breaks a scan. Runs on completed bars; the live partial bar only
+        populates the *_attempt flags."""
+        cfg = self.settings.entry.setups
+        if not cfg.enabled or not bars:
+            return
+        try:
+            partial = bool(is_market_hours())
+            sup, res = self._tv_levels(symbol)
+            read = detect_setups(bars, cfg, support=sup, resistance=res, last_bar_partial=partial)
+            if read is None:
+                return
+            f = read.features
+            ctx.setups, ctx.primary_setup, ctx.setup_bias = list(read.setups), read.primary, read.bias
+            ctx.setup_score, ctx.setups_fired_now = read.score, list(read.fired_now)
+            ctx.bb_width_pct, ctx.vol_ratio_20 = f.get("bb_width_pct"), f.get("vol_ratio_20")
+            ctx.bb_squeeze = read.flags.get("bb_squeeze")
+            ctx.ttm_squeeze = read.flags.get("ttm_squeeze")
+            ctx.donchian_high_20, ctx.donchian_low_20 = f.get("donchian_high_20"), f.get("donchian_low_20")
+            ctx.support_ref, ctx.support_source = f.get("support_ref"), f.get("support_source")
+            ctx.dist_to_support_pct = f.get("dist_to_support_pct")
+            ctx.resistance_ref = f.get("resistance_ref")
+            ctx.dist_to_resistance_pct = f.get("dist_to_resistance_pct")
+            ctx.live_breakout_attempt = read.live.get("breakout_attempt")
+            ctx.live_breakdown_attempt = read.live.get("breakdown_attempt")
+            d = read.as_dict()
+            d["partial_bar"] = partial
+            self.last_setups[symbol] = d
+            self._refresh_risk_profile(symbol, bars)
+            # Setup-accuracy tracker: log each label that fired on the completed bar (deduped per
+            # bar) and fill in forward outcomes for earlier fires once the bars exist.
+            if self.setup_events is not None:
+                from .setup_tracker import record_fires, resolve_for_symbol
+                now = utcnow()
+                # labels on the bar BEFORE the last completed one -> episode-start stamping
+                completed = bars[:-1] if (partial and len(bars) > 1) else bars
+                prev_labels = None
+                if len(completed) > MIN_BARS:
+                    prev_flags, _ = detect_flags(completed[:-1], cfg, support=sup, resistance=res)
+                    prev_labels = set(compose(prev_flags))
+                record_fires(self.setup_events, symbol, read, bars, now, partial=partial,
+                             prev_labels=prev_labels)
+                resolve_for_symbol(self.setup_events, symbol, bars, now)
+        except Exception as exc:  # noqa: BLE001 -- advisory; never break the scan
+            log.warning("setup detection failed for %s: %s", symbol, exc)
 
     def _support_ceiling(self, underlying: str, crit) -> float | None:
         """Strike ceiling from the latest TradingView support level, for the strike-below-support
@@ -716,6 +940,7 @@ class OpportunityScanner:
         )
         ctx = build_context(symbol, bars, self._atm_iv(chain), iv_hist, criteria)
         await self._overlay_quality(symbol, ctx, bars)
+        self._overlay_setups(symbol, ctx, bars)
         return ctx
 
     async def _overlay_quality(self, symbol: str, ctx: UnderlyingContext, bars: list[dict]) -> None:

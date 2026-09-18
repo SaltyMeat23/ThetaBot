@@ -48,7 +48,18 @@ SYSTEM = (
     "or through their strike (call out roll_window and ITM names); plus sector concentration and "
     "whether the loss breaker is near tripping. (5) When 'your_history' has a bucket with enough "
     "trades (n >= ~15) you may cite it (e.g. 'your 0.25-0.30 delta puts have won X%'), but treat "
-    "small-n buckets as weak and say so — never over-claim on a handful of trades.\n\n"
+    "small-n buckets as weak and say so — never over-claim on a handful of trades. Each name's "
+    "'setups' are deterministic daily-bar pattern labels (washout / coiling / breakout / breakdown / "
+    "support tests) with a 'setup_bias' (favorable or avoid for a premium seller) and live "
+    "'*_attempt' flags for today's unfinished bar: use them to say what is HAPPENING structurally, "
+    "flag an 'avoid' read (fresh breakdown, support break, falling knife, or a fresh BREAKOUT -- "
+    "measured on these names, breakouts carry the highest assignment rate for a put seller) as a "
+    "reason to stand aside, and cite your_history.primary_setup buckets only when n is adequate. "
+    "A name's 'risk_profile' (1y strike survival at the bot's cushion: touch_rate, itm_rate, "
+    "avg_worst_pct, suggested_cushion) says how violent that name's path is; a suggested_cushion "
+    "above the base means a wider strike is warranted there. 'setup_accuracy' "
+    "is the MEASURED forward outcome of each setup label on these names (hit_rate_5d, avg_ret_5d, "
+    "avg_mae_10d = worst 10-bar excursion); treat any row with n < 15 as weak evidence.\n\n"
     "Reference the given numbers; never invent numbers beyond those provided. Distinguish a "
     "market-wide dip (a name's drawdown ~ SPY's drawdown = systemic) from a name-specific breakdown. "
     "Do NOT dwell on RSI / ADX / Bollinger %B (weak filters at this horizon), and never use sentiment "
@@ -67,7 +78,8 @@ def _flywheel_slim(fw: dict | None) -> dict | None:
     most to a premium seller. Keeps buckets with n>=3 (small-n flagged by the prompt)."""
     if not fw:
         return None
-    keep = ("delta", "iv_rank", "dte", "iv_rv_ratio", "quality_score", "mkt_regime", "exit_reason")
+    keep = ("delta", "iv_rank", "dte", "iv_rv_ratio", "quality_score", "mkt_regime", "exit_reason",
+            "primary_setup")
     by = fw.get("by_feature", {}) or {}
     slim = {d: [b for b in by.get(d, []) if (b.get("n") or 0) >= 3] for d in keep if d in by}
     return {"summary": fw.get("summary", {}), "by_feature": {k: v for k, v in slim.items() if v}}
@@ -103,6 +115,7 @@ async def generate_brief_analysis(
     flywheel: dict | None = None, skips: list | None = None, accounts: list | None = None,
     stats: dict | None = None, risk: dict | None = None, ai_reviews: list | None = None,
     open_positions: list | None = None, total_buying_power: float | None = None,
+    setup_accuracy: list | None = None, risk_profiles: dict | None = None,
 ) -> str | None:
     """Return a short prose tactical read, or None on any error / missing client."""
     if client is None or not hasattr(client, "summarize"):
@@ -138,6 +151,16 @@ async def generate_brief_analysis(
             "bot_break_even": cd.get("break_even"),
             "expected_move": cush["expected_move"], "strike_em": cush["strike_em"],
             "support_em": cush["support_em"], "support_below_strike_em": cush["support_below_strike_em"],
+            # deterministic technical-setup read (entry/setups.py)
+            "setups": ctx.get("setups"), "primary_setup": ctx.get("primary_setup"),
+            "setup_bias": ctx.get("setup_bias"), "setup_score": ctx.get("setup_score"),
+            "dist_to_support_pct": ctx.get("dist_to_support_pct"), "vol_ratio_20": ctx.get("vol_ratio_20"),
+            "live_breakout_attempt": ctx.get("live_breakout_attempt"),
+            "live_breakdown_attempt": ctx.get("live_breakdown_attempt"),
+            # per-name strike-survival risk profile (services/risk_profile.py), when computed
+            "risk_profile": ({k: rp.get(k) for k in ("n", "touch_rate", "itm_rate", "avg_worst_pct",
+                                                      "suggested_cushion", "needs_tightening")}
+                             if (rp := (risk_profiles or {}).get(sym)) else None),
         })
     prices = {s: (c or {}).get("price") for s, c in (contexts or {}).items()}
     atrs = {s: (c or {}).get("atr") for s, c in (contexts or {}).items()}
@@ -155,6 +178,10 @@ async def generate_brief_analysis(
         "risk": risk or None,
         "assignment": assignment,
         "management": management,
+        # measured forward outcomes per setup label on THESE names (top 5 by n); n < 15 is weak
+        "setup_accuracy": [{k: r.get(k) for k in ("label", "bias", "n", "hit_rate_5d", "avg_ret_5d",
+                                                  "avg_mae_10d")}
+                           for r in (setup_accuracy or [])[:5]] or None,
         "skipped_today": [{"symbol": s.get("symbol"), "reason": s.get("reason")}
                           for s in (skips or [])],
         "watchlist": names,

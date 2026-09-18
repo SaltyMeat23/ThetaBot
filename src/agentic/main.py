@@ -25,6 +25,8 @@ from .services.killswitch import KillSwitch
 from .services.monitor import MonitorLoop
 from .services.reconcile import ReconcileLoop
 from .services.reporting import ReportingLoop
+from .services.tax_reserve import TaxReserveLoop
+from .store.tax_reserve import TaxReserveStore
 from .services.roll import RollManager
 from .services.scanner import OpportunityScanner
 from .services.signal_processor import SignalProcessor
@@ -35,6 +37,8 @@ from .store.audit import AuditStore
 from .store.db import Database
 from .store.decisions import DecisionStore
 from .store.entry_candidates import EntryCandidateStore
+from .store.briefs import BriefStore
+from .store.setup_events import SetupEventStore
 from .store.entry_decisions import EntryDecisionStore
 from .store.orders import OrderStore
 from .store.positions import PositionStore
@@ -63,7 +67,7 @@ def build_market_data(settings: Settings, broker=None) -> MarketDataProvider:
 def build_web_server(settings, signals, killswitch, approval_gate, audit,
                      positions, orders, decisions, entry_decisions, scanner, trade_journal,
                      tv_indicators=None, ai_reviews=None, notifier=None, entry_candidates=None,
-                     news=None):
+                     news=None, briefs=None, tax_reserve=None, tax_reserve_store=None):
     """Build a uvicorn Server for the control/webhook/dashboard API, or None if disabled."""
     if not settings.web.enabled:
         log.info("Web API disabled (web.enabled=false).")
@@ -90,7 +94,8 @@ def build_web_server(settings, signals, killswitch, approval_gate, audit,
         positions=positions, orders=orders, decisions=decisions,
         entry_decisions=entry_decisions, scanner=scanner, trade_journal=trade_journal,
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
-        entry_candidates=entry_candidates, news=news,
+        entry_candidates=entry_candidates, news=news, briefs=briefs,
+        tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
     )
     app = create_app(deps)
     config = uvicorn.Config(
@@ -115,9 +120,12 @@ async def main_async(config_path: str | None = None) -> None:
     decisions = DecisionStore(db)
     entry_decisions = EntryDecisionStore(db)
     entry_candidates = EntryCandidateStore(db)
+    setup_events = SetupEventStore(db)
     trade_journal = TradeJournalStore(db)
     tv_indicators = TVIndicatorStore(db)
     news = NewsStore(db)
+    briefs = BriefStore(db)
+    tax_reserve_store = TaxReserveStore(db)
     ai_reviews = AIReviewStore(db)
     ai_reviewer = AIReviewer(settings.ai, build_reviewer_client(settings.ai))
     orders = OrderStore(db)
@@ -139,6 +147,7 @@ async def main_async(config_path: str | None = None) -> None:
         company_data=build_company_data(settings, broker),
         entry_candidates=entry_candidates,
         news_provider=build_news_provider(settings), news=news,
+        setup_events=setup_events,
     )
     approval_gate = ApprovalGate(
         settings, decisions, positions, executor, audit, notifier=notifier
@@ -180,11 +189,18 @@ async def main_async(config_path: str | None = None) -> None:
         notifier=notifier, trade_journal=trade_journal, entry_decisions=entry_decisions,
     )
 
+    tax_reserve = TaxReserveLoop(
+        settings, broker, market_data, trade_journal, tax_reserve_store, audit, killswitch,
+        notifier=notifier,
+    )
+    scanner.tax_reserve_store = tax_reserve_store
+
     web_server = build_web_server(
         settings, signals, killswitch, approval_gate, audit,
         positions, orders, decisions, entry_decisions, scanner, trade_journal,
         tv_indicators=tv_indicators, ai_reviews=ai_reviews, notifier=notifier,
-        entry_candidates=entry_candidates, news=news,
+        entry_candidates=entry_candidates, news=news, briefs=briefs,
+        tax_reserve=tax_reserve, tax_reserve_store=tax_reserve_store,
     )
 
     reporting = ReportingLoop(
@@ -202,6 +218,7 @@ async def main_async(config_path: str | None = None) -> None:
         reconcile.stop()
         scanner.stop()
         reporting.stop()
+        tax_reserve.stop()
         if web_server is not None:
             web_server.should_exit = True
 
@@ -214,6 +231,7 @@ async def main_async(config_path: str | None = None) -> None:
 
     tasks = [asyncio.create_task(monitor.run()), asyncio.create_task(reconcile.run())]
     tasks.append(asyncio.create_task(reporting.run()))
+    tasks.append(asyncio.create_task(tax_reserve.run()))
     if settings.entry.enabled:
         log.info("Entry scanner ENABLED (watchlist=%d, feed=%s).",
                  len(settings.entry.watchlist), settings.entry.feed)

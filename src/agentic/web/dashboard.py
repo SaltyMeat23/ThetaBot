@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from ..services.stats import compute_stats, position_rows
@@ -280,6 +280,51 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
             deps.settings.ai.tv_indicator_max_age_seconds,
         )
 
+    @router.get("/api/setups")
+    async def api_setups() -> dict:
+        """Technical setup detections per watchlist name (deterministic daily-bar reads: washout /
+        coiling / breakout / breakdown / support tests). Served from the scanner's cache -- no
+        market-data calls. Descriptive; the opt-in setup gates and prefer_setups tilt are what
+        feed trading."""
+        from ..services.setups_view import build_setups_view
+        sc = deps.scanner
+        return build_setups_view(
+            getattr(sc, "last_setups", {}) if sc else {},
+            getattr(sc, "last_context", {}) if sc else {},
+            getattr(sc, "last_skips", []) if sc else [],
+            deps.settings.entry, getattr(sc, "last_scan_at", None) if sc else None,
+        )
+
+    @router.get("/api/risk-profile")
+    async def api_risk_profile() -> dict:
+        """Per-name strike-survival risk profile (computed daily by the scanner from ~1y of bars) and
+        the tightening-only per-ticker cushion suggestions derived from it. Read-only."""
+        from ..entry.setups import PUT_SELLER_AVOID_PRESET
+        from ..services.risk_profile import propose_ticker_cushions
+        sc = deps.scanner
+        profiles = dict(getattr(sc, "last_risk_profile", {}) or {}) if sc else {}
+        e = deps.settings.entry
+        proposals = propose_ticker_cushions(profiles, e.per_ticker, base_cushion=e.setups.profile_base_cushion)
+        return {
+            "config": {"base_cushion": e.setups.profile_base_cushion, "horizon": e.setups.profile_horizon,
+                       "target_itm_rate": e.setups.target_itm_rate,
+                       "put_seller_avoid_preset": list(PUT_SELLER_AVOID_PRESET)},
+            "profiles": [profiles[s] for s in sorted(profiles)],
+            "proposals": proposals,
+        }
+
+    @router.get("/api/setups/accuracy")
+    async def api_setups_accuracy() -> dict:
+        """Measured forward outcomes per setup label (the setup-accuracy tracker): n, 5-day hit rate,
+        average 5/10-day returns, average 10-day max adverse excursion. Descriptive; small n = weak."""
+        store = getattr(deps.scanner, "setup_events", None) if deps.scanner else None
+        if store is None:
+            return {"available": False, "rows": [], "recent": []}
+        try:
+            return {"available": True, "rows": store.accuracy(), "recent": store.recent(50)}
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "rows": [], "recent": [], "error": str(exc)}
+
     @router.get("/api/ops")
     async def api_ops() -> dict:
         """One-call operational snapshot: loops, killswitch, sync, scan health, TV freshness."""
@@ -462,6 +507,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         return {
             "enabled": deps.settings.macro.enabled,
             "hard_gate": deps.settings.macro.hard_gate,
+            "skip_confirmed_downtrend": deps.settings.macro.skip_confirmed_downtrend,
+            "downtrend_confirm_days": deps.settings.macro.downtrend_confirm_days,
             "regime": reg.as_dict() if reg is not None else None,
         }
 
@@ -572,6 +619,16 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 ai_reviews = (deps.ai_reviews.recent(8) if deps.ai_reviews is not None else []) or []
             except Exception:  # noqa: BLE001
                 ai_reviews = []
+            try:  # measured setup outcomes on these names (setup-accuracy tracker); advisory
+                _se = getattr(sc, "setup_events", None) if sc else None
+                setup_accuracy = _se.accuracy() if _se is not None else None
+            except Exception:  # noqa: BLE001
+                setup_accuracy = None
+            risk_profiles = dict(getattr(sc, "last_risk_profile", {}) or {}) if sc else None
+            try:
+                tax_reserve = _reserve_payload()
+            except Exception:  # noqa: BLE001
+                tax_reserve = None
 
             # Open short options (for the management + assignment-capacity reads) and total buying
             # power across accounts. Drop paper positions in live mode.
@@ -596,7 +653,8 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                         tv_by_symbol=tv_by_symbol, regime=regime, econ_events=econ_events,
                         flywheel=flywheel, skips=skips, accounts=accounts, stats=stats,
                         risk=risk, ai_reviews=ai_reviews, open_positions=open_positions,
-                        total_buying_power=total_bp)
+                        total_buying_power=total_bp, setup_accuracy=setup_accuracy,
+                        risk_profiles=risk_profiles)
             except Exception:  # noqa: BLE001 — AI is advisory; the brief renders without it
                 ai_analysis = None
 
@@ -604,10 +662,43 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
                 watchlist=watchlist, contexts=contexts, candidates=candidates,
                 tv_by_symbol=tv_by_symbol, regime=regime, news_by_symbol=news_by_symbol,
                 accounts=accounts, econ_events=econ_events, now=now, ai_analysis=ai_analysis,
-                open_positions=open_positions, total_buying_power=total_bp)
-            return {"title": title, "body": body}
+                open_positions=open_positions, total_buying_power=total_bp,
+                tax_reserve=tax_reserve, tier_proposals=(list(getattr(sc, "last_tier_proposals", []) or []) if sc else []))
+            out = {"title": title, "body": body, "created_at": now.isoformat(),
+                   "has_ai": ai_analysis is not None, "id": None}
+            # Persist every generation so the brief can be re-read from a phone later without
+            # regenerating (which hits the broker + the AI). Advisory: a save failure never
+            # hides the brief that was just built.
+            try:
+                if deps.briefs is not None:
+                    out["id"] = deps.briefs.save(
+                        title, body, has_ai=ai_analysis is not None, created_at=now,
+                        meta={"watchlist": len(watchlist), "open_positions": len(open_positions),
+                              "accounts": len([a for a in accounts if "error" not in a])})
+            except Exception:  # noqa: BLE001
+                out["id"] = None
+            return out
         except Exception as exc:  # noqa: BLE001 — a brief must never 500 the dashboard
-            return {"title": "Weekly tactical brief", "body": f"Brief unavailable: {exc}"}
+            return {"title": "Weekly tactical brief", "body": f"Brief unavailable: {exc}",
+                    "created_at": now.isoformat(), "has_ai": False, "id": None}
+
+    @router.get("/api/briefs")
+    async def api_briefs(limit: int = 30) -> dict:
+        """Saved briefs, newest first (no bodies). ``latest`` carries the newest full brief so the
+        Brief tab opens on it without a regeneration."""
+        store = deps.briefs
+        if store is None:
+            return {"available": False, "briefs": [], "latest": None}
+        rows = store.recent(max(1, min(int(limit), 200)))
+        return {"available": True, "briefs": rows, "latest": store.latest()}
+
+    @router.get("/api/briefs/{brief_id}")
+    async def api_brief_one(brief_id: str) -> dict:
+        store = deps.briefs
+        row = store.get(brief_id) if store is not None else None
+        if row is None:
+            raise HTTPException(status_code=404, detail="brief not found")
+        return row
 
     @router.get("/api/ai-reviews")
     async def api_ai_reviews(limit: int = 100) -> dict:
@@ -634,14 +725,58 @@ def make_dashboard_router(deps: "WebDeps") -> APIRouter:
         sc = deps.scanner
         holds = list(getattr(sc, "last_holdings", []) or []) if sc else []
         from ..domain.enums import Direction, OptionType
+        from ..services.holdings import reserve_symbols
+        reserve = reserve_symbols(deps.settings)
+        clock = dict(getattr(sc, "last_cc_clock", {}) or {}) if sc else {}
         covered: dict[str, int] = {}
         for p in deps.positions.list_open():
             if p.direction is Direction.SHORT and p.option_type is OptionType.CALL:
                 covered[p.underlying] = covered.get(p.underlying, 0) + p.quantity
         return {"holdings": [{
             "symbol": h.symbol, "shares": h.quantity, "average_cost": h.average_cost,
-            "coverable": h.quantity // 100, "covered": covered.get(h.symbol, 0),
+            "coverable": int(h.quantity // 100), "covered": covered.get(h.symbol, 0),
+            "reserve": h.symbol.upper() in reserve, "clock": clock.get(h.symbol),
         } for h in holds]}
+
+    def _reserve_payload() -> dict:
+        """Tax-reserve state for the dashboard, digest and brief: config, held shares (walled off),
+        ledger totals, recent periods, what the next sweep would do."""
+        sc = deps.scanner
+        loop = getattr(deps, "tax_reserve", None)
+        store = getattr(deps, "tax_reserve_store", None)
+        out: dict = {"config": deps.settings.tax_reserve.model_dump(),
+                     "holding": (getattr(sc, "last_reserve", None) if sc else None),
+                     "clock": (dict(getattr(sc, "last_cc_clock", {}) or {}) if sc else {}),
+                     "status": None, "totals": None, "recent": []}
+        try:
+            out["status"] = loop.status() if loop is not None else None
+        except Exception as exc:  # noqa: BLE001
+            out["status_error"] = str(exc)
+        try:
+            if store is not None:
+                out["totals"] = store.totals()
+                out["recent"] = store.recent(12)
+        except Exception as exc:  # noqa: BLE001
+            out["ledger_error"] = str(exc)
+        return out
+
+    @router.get("/api/tax-reserve")
+    async def api_tax_reserve() -> dict:
+        return _reserve_payload()
+
+    @router.get("/api/tiers")
+    async def api_tiers() -> dict:
+        """Quality names the account can now afford (proposal only; the user adds with one tap)."""
+        from ..services.tiers import next_unlock
+        sc = deps.scanner
+        e = deps.settings.entry
+        av = getattr(sc, "last_account_value", None) if sc else None
+        prices = dict(getattr(sc, "_tier_prices", {}) or {}) if sc else {}
+        return {"ready": list(getattr(sc, "last_tier_proposals", []) or []) if sc else [],
+                "next": next_unlock(e.watchlist_tiers, e.watchlist, av, e.sizing.max_pct_per_underlying, prices),
+                "account_value": av, "per_name_pct": e.sizing.max_pct_per_underlying,
+                "tiers": {k: {"min_collateral": v.get("min_collateral"), "note": v.get("note", "")}
+                          for k, v in (e.watchlist_tiers or {}).items()}}
 
     @router.get("/api/journal")
     async def api_journal(limit: int = 200) -> dict:
@@ -870,6 +1005,67 @@ _PAGE = """<!doctype html>
   .reason{white-space:normal}
   .foot{font-size:11.5px;color:var(--faint);text-align:center;padding:4px 0 2px}
   .foot code{font-family:var(--mono);background:var(--raise);padding:1px 5px;border-radius:4px}
+  /* ---- readability: larger table text, touch-sized rows, sticky first column on wide tables ---- */
+  table{font-size:13.5px}
+  th,td{padding:9px 10px}
+  th{font-size:11px}
+  .more-body{position:relative}
+  .more-body th:first-child,.more-body td:first-child{position:sticky;left:0;background:var(--card);z-index:1;
+    box-shadow:1px 0 0 var(--line)}
+  tbody tr:nth-child(even) td{background:color-mix(in srgb,var(--raise) 60%,var(--card))}
+  .hint{font-size:12.5px;line-height:1.5;padding:0 16px 14px}
+  .ctl .hint{padding:0;margin-top:7px}
+  .stat .k{font-size:14px} .stat .v{font-size:19px}
+  /* pills for categorical reads (bias, live) */
+  .pill{display:inline-block;font-size:11.5px;font-weight:650;padding:2px 9px;border-radius:999px;
+    border:1px solid var(--line);color:var(--muted);background:var(--raise);white-space:nowrap}
+  .pill.fav{color:var(--pos);background:var(--pos-bg);border-color:transparent}
+  .pill.avoid{color:var(--neg);background:var(--neg-bg);border-color:transparent}
+  .pill.mixed{color:var(--warn);background:var(--warn-bg);border-color:transparent}
+  .pill.live{color:var(--warn);background:var(--warn-bg);border-color:transparent}
+  .pill.up{color:var(--pos);background:var(--pos-bg);border-color:transparent}
+  .lbl{display:inline-block;font-size:12px;padding:1px 7px;margin:1px 3px 1px 0;border-radius:6px;
+    background:var(--accent-soft);color:var(--accent);white-space:nowrap}
+  .lbl.avoid{background:var(--neg-bg);color:var(--neg)}
+  .lbl.fav{background:var(--pos-bg);color:var(--pos)}
+  /* collapsible cards: tap the header to fold a section; state remembered per device */
+  .card-h.clp{cursor:pointer;user-select:none;-webkit-tap-highlight-color:transparent}
+  .card-h.clp h2{display:flex;align-items:center;gap:8px}
+  .chev{display:inline-block;width:8px;height:8px;border-right:2px solid var(--faint);border-bottom:2px solid var(--faint);
+    transform:rotate(45deg);transition:transform .15s;margin-top:-3px;flex:none}
+  .card2.collapsed .chev{transform:rotate(-45deg);margin-top:2px}
+  .card2.collapsed > :not(.card-h){display:none}
+  .card2.collapsed .card-h{padding-bottom:14px}
+  .sub-h{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:16px 16px 8px;
+    margin-top:6px;border-top:1px solid var(--line);font-size:13px;font-weight:650}
+  .sub-h .count{font-weight:600}
+  /* brief archive */
+  #brief .card-h{flex-wrap:wrap}
+  .brief-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  select.f{background:var(--raise);border:1px solid var(--line);border-radius:8px;padding:7px 10px;color:var(--ink);
+    font:inherit;font-size:13px;max-width:100%}
+  .brief-meta{padding:10px 16px 0;font-size:12.5px;color:var(--muted);display:flex;gap:6px 14px;flex-wrap:wrap}
+  .brief-meta b{color:var(--ink);font-weight:600}
+  #brief-body{max-width:74ch;font-size:14.5px;line-height:1.6}
+  #brief-body h2{font-size:17px;margin:4px 0 8px}
+  #brief-body h3{font-size:14.5px;margin:18px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--line)}
+  #brief-body h4{font-size:13.5px;margin:12px 0 4px;color:var(--muted)}
+  /* tab bar: top on desktop, thumb-reach bottom bar on phones */
+  .tab-btn .ti{display:none}
+  @media (max-width:760px){
+    .tabs{position:fixed;top:auto;bottom:0;left:0;right:0;margin:0;z-index:40;
+      padding:6px 8px calc(6px + env(safe-area-inset-bottom,0px));gap:2px;justify-content:space-around;
+      border-top:1px solid var(--line);border-bottom:0;background:color-mix(in srgb,var(--card) 94%,transparent)}
+    .tab-btn{flex:1 1 0;padding:6px 2px;font-size:10.5px;border:0;background:transparent;border-radius:10px;
+      display:flex;flex-direction:column;align-items:center;gap:2px;min-width:0}
+    .tab-btn .ti{display:block;font-size:19px;line-height:1.1}
+    .tab-btn.active{background:var(--accent-soft);color:var(--accent);border-color:transparent}
+    .nav-dot{display:none}
+    .app{padding-bottom:calc(76px + env(safe-area-inset-bottom,0px))}
+    .masthead h1{font-size:17px}
+    .fact .v{font-size:13.5px}
+    .scr-filters label{flex:1 1 40%}
+  }
 </style>
 </head>
 <body>
@@ -889,11 +1085,11 @@ _PAGE = """<!doctype html>
 
   <nav class="tabs" id="tabs">
     <span class="nav-dot" id="nav-status" title="Robinhood connection"></span>
-    <button class="tab-btn" data-tab="overview">Overview</button>
-    <button class="tab-btn" data-tab="research">Watchlist</button>
-    <button class="tab-btn" data-tab="brief">Brief</button>
-    <button class="tab-btn" data-tab="tuning">Tuning</button>
-    <button class="tab-btn" data-tab="history">History</button>
+    <button class="tab-btn" data-tab="overview"><span class="ti">&#9673;</span>Overview</button>
+    <button class="tab-btn" data-tab="research"><span class="ti">&#9776;</span>Watchlist</button>
+    <button class="tab-btn" data-tab="brief"><span class="ti">&#9636;</span>Brief</button>
+    <button class="tab-btn" data-tab="tuning"><span class="ti">&#9881;</span>Tuning</button>
+    <button class="tab-btn" data-tab="history"><span class="ti">&#8635;</span>History</button>
   </nav>
 
   <div class="tabpane" id="pane-overview">
@@ -915,11 +1111,52 @@ _PAGE = """<!doctype html>
         <div class="card-h"><h2>Overall</h2><span class="count">all-time · real trades</span></div>
         <div id="week"></div>
       </section>
+      <section class="card2" id="reserve-card">
+        <div class="card-h"><h2>Tax reserve</h2><span class="count" id="rsv-note"></span></div>
+        <div id="reserve"></div>
+      </section>
+      <section class="card2" id="tiers-card" data-fold="closed">
+        <div class="card-h"><h2>Ready to add</h2><span class="count" id="tiers-note"></span></div>
+        <div class="ctl" id="tiers"></div>
+      </section>
     </div>
   </div>
   </div>
 
   <div class="tabpane" id="pane-research" hidden>
+  <section class="card2" id="setups">
+    <div class="card-h"><h2>Setups today</h2><span class="count" id="setups-note">deterministic daily-bar reads</span></div>
+    <div class="more-body" style="padding:0">
+      <table id="setups-tbl"><thead><tr>
+        <th>Symbol</th><th class="num">Price</th><th>Setup(s)</th><th>Bias</th><th>Live</th>
+        <th class="num">RSI</th><th class="num">%B</th><th class="num">BBw</th><th class="num">Vol&times;</th>
+        <th class="num">Support</th><th class="num">Resist</th>
+      </tr></thead><tbody><tr><td colspan="11" class="muted">Waiting for the next scan.</td></tr></tbody></table>
+    </div>
+    <div class="hint">Washout (oversold), coiling (volatility squeeze), breakout &amp; breakdown (confirmed on volume), and support tests, read from completed daily bars. <b>Live</b> = today's unfinished bar breaking the range or support right now. These feed the bot through the opt-in setup gates and the <i>prefer setups</i> tilt (Tuning tab); otherwise descriptive.</div>
+    <div class="sub-h">Which setups have edge here <span class="count" id="setups-acc-note"></span></div>
+    <div class="more-body" style="padding:0">
+      <table id="setups-acc-tbl"><thead><tr>
+        <th>Setup</th><th>Bias</th><th class="num">n</th><th class="num">Episodes</th><th class="num">Hit 5d</th>
+        <th class="num">Avg 5d</th><th class="num">Avg 10d</th><th class="num">MAE 10d</th><th class="num">Pending</th>
+      </tr></thead><tbody><tr><td colspan="9" class="muted">No resolved fires yet — outcomes fill in ~10 trading days after each setup fires.</td></tr></tbody></table>
+    </div>
+    <div class="hint">Measured on <b>your</b> names: each fire is logged, then scored on what actually happened 5 and 10 bars later. Hit = a favorable setup didn't fall / an avoid setup did. <b>MAE</b> = worst 10-day excursion below the fire price — the put-seller's question. Rows are greyed until n &ge; 15.</div>
+    <div class="sub-h">Per-name risk profile <span class="count" id="rp-note"></span></div>
+    <div class="more-body" style="padding:0">
+      <table id="rp-tbl"><thead><tr>
+        <th>Symbol</th><th class="num">n</th><th class="num">Touched</th><th class="num">ITM at exp</th>
+        <th class="num">Avg worst</th><th class="num">Suggested cushion</th><th>Note</th>
+      </tr></thead><tbody><tr><td colspan="7" class="muted">Profiles compute on each name's first scan of the day.</td></tr></tbody></table>
+    </div>
+    <div class="hint">Strike survival over ~1y: a put <span id="rp-base"></span> expected-moves below spot, held <span id="rp-h"></span> bars — how often it was <b>touched</b> (roll pressure) and <b>finished ITM</b> (assignment), plus the smallest cushion that keeps ITM under the <span id="rp-target"></span> target. Every watchlist name — including a new add — is profiled automatically. Apply suggestions from the Tuning tab.</div>
+  </section>
+
+  <section class="card2">
+    <div class="card-h"><h2>TradingView levels</h2><span class="count" id="tv-last"></span></div>
+    <div class="ctl" id="tv-levels"></div>
+  </section>
+
   <section class="card2">
     <div class="card-h"><h2>Scanner</h2></div>
     <div class="ctl">
@@ -946,10 +1183,8 @@ _PAGE = """<!doctype html>
     </div>
   </section>
 
-  <section class="card2">
-    <div class="card-h"><h2>TradingView levels</h2><span class="count" id="tv-last"></span></div>
-    <div class="ctl" id="tv-levels"></div>
-  </section>
+
+
 
   <section class="card2" id="screener">
     <div class="card-h"><h2>Screener</h2><span class="count">on-demand CSP scan</span></div>
@@ -992,10 +1227,16 @@ _PAGE = """<!doctype html>
   </div>
 
   <div class="tabpane" id="pane-brief" hidden>
-  <section class="card2" id="brief">
-    <div class="card-h"><h2>Weekly Tactical Brief</h2><button id="brief-run">Generate</button></div>
-    <div class="more-body" style="padding:12px">
-      <div id="brief-body" class="muted">Monday prep: market backdrop, this week's catalysts, per-name levels + the strikes the bot's rules are eyeing, and advisory ideas across your accounts. Click <b>Generate</b> (reads your accounts live — takes a few seconds). Descriptive only — not financial advice.</div>
+  <section class="card2" id="brief" data-nofold="1">
+    <div class="card-h"><h2>Weekly Tactical Brief</h2>
+      <div class="brief-tools">
+        <select class="f" id="brief-list" title="Saved briefs"><option value="">Saved briefs…</option></select>
+        <button class="go" id="brief-run">Generate new</button>
+      </div>
+    </div>
+    <div class="brief-meta" id="brief-meta"></div>
+    <div class="more-body" style="padding:12px 16px 16px">
+      <div id="brief-body" class="muted">Monday prep: market backdrop, this week's catalysts, per-name levels + the strikes the bot's rules are eyeing, and advisory ideas across your accounts. Every brief you generate is <b>saved</b> — pick an earlier one from the list, or tap <b>Generate new</b> (reads your accounts live — takes a few seconds). Descriptive only — not financial advice.</div>
     </div>
   </section>
   </div>
@@ -1004,7 +1245,32 @@ _PAGE = """<!doctype html>
   <section class="card2">
     <div class="card-h"><h2>Tuning</h2><span class="count">applies live · persists</span></div>
     <div class="ctl">
-      <div class="ctl-lab">Multiple CSPs per ticker</div>
+      <div class="ctl-lab">Tax reserve / gains sweep</div>
+      <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-on"/> Sweep a share of net realized gains into a symbol of your choice each week</label></div>
+      <div class="scr-filters">
+        <label>% of net gains<input class="f scrn" id="tn-tr-pct" inputmode="decimal" placeholder="20"/></label>
+        <label>Symbol<input class="f scrn" id="tn-tr-sym" placeholder="SGOV" maxlength="6" autocapitalize="characters"/></label>
+        <label>Day<select class="f" id="tn-tr-day"><option value="0">Mon</option><option value="1">Tue</option><option value="2">Wed</option><option value="3">Thu</option><option value="4">Fri</option></select></label>
+        <label>Time (ET)<input class="f scrn" id="tn-tr-time" placeholder="15:40"/></label>
+        <button class="go" id="tn-tr-save">Save</button>
+      </div>
+      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-tr-dry"/> Dry run (log what it would buy, place nothing)</label></div>
+      <div class="hint">Each week at the set time (inside market hours, since share market orders only fill then) the bot adds up the realized P&amp;L closed since the last sweep, carries any loss forward, and buys that share of a positive net in the ETF. The reserve is walled off: it never counts as trading capital, never gets calls written on it, and the bot never sells it. Withdraw it yourself when taxes are due.</div>
+      <div class="say" id="tn-tr-say"></div>
+
+      <div class="ctl-lab" style="margin-top:18px">Market regime</div>
+      <div class="row"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-skip-dt"/> Pause new puts in a confirmed downtrend</label></div>
+      <div class="row" style="margin-top:8px">
+        <span class="muted" style="font-size:13px">SPY below its 200-day for</span>
+        <input class="f wk mono" id="tn-dt-days" inputmode="numeric" placeholder="5"/>
+        <span class="muted" style="font-size:13px">straight sessions</span>
+        <button class="go" id="tn-dt-save">Save</button>
+      </div>
+      <div class="scanline" id="tn-dt-status"></div>
+      <div class="hint">Measured on your names since 2020: once SPY has closed below its 200-day for 5 sessions, a put 0.7 expected-moves out earned about +0.1% per trade against +0.9% elsewhere, with the most assignments. Skipping only those days (panic regimes stay open, they paid best) lifted P&amp;L per trade from +0.89% to +1.00% and cut total losses 19%. New put entries only; open positions, rolls and covered calls carry on.</div>
+      <div class="say" id="tn-dt-say"></div>
+
+      <div class="ctl-lab" style="margin-top:18px">Multiple CSPs per ticker</div>
       <div class="row">
         <input class="f wk mono" id="tn-uc" inputmode="decimal" placeholder="0"/>
         <span class="muted" style="font-size:13px">% max per name</span>
@@ -1021,6 +1287,29 @@ _PAGE = """<!doctype html>
       </div>
       <div class="hint"><b>Cushion</b>: require the strike to sit at least N option-implied expected-moves out of the money (scales to each name's volatility). <b>IV/RV</b>: only sell when implied vol beats realized by this ratio (e.g. 1.1). Blank = off.</div>
       <div class="say" id="tn-gates-say"></div>
+
+      <div class="ctl-lab" style="margin-top:18px">Setup gates</div>
+      <div class="scr-filters">
+        <label>Avoid setups<input class="f" id="tn-avoid" placeholder="e.g. breakdown_confirmed, support_break"/></label>
+        <label>Require setups<input class="f" id="tn-require" placeholder="e.g. washout_at_support"/></label>
+        <button class="go" id="tn-setups-save">Save</button>
+      </div>
+      <div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer"><input type="checkbox" id="tn-prefer-setups"/> Prefer favorable setups when ranking (reorders only)</label></div>
+      <div class="hint">Comma-separated labels from the Setups panel. <b>Avoid</b> skips a name while any listed label is active (e.g. a fresh breakdown); <b>Require</b> enters only when one is active. Blank = off (fail-open when a name has no read).</div>
+      <div class="row" style="margin-top:8px">
+        <button class="go" id="tn-preset-putseller">Apply put-seller preset</button>
+        <span class="muted" style="font-size:12.5px">avoid the breakout family — measured highest assignment rate on your names</span>
+      </div>
+      <div class="say" id="tn-setups-say"></div>
+
+      <div class="ctl-lab" style="margin-top:18px">Per-ticker cushions <span class="count" id="tn-cush-note"></span></div>
+      <div id="tn-cush-list" class="tvcruft"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="go" id="tn-cush-apply">Apply suggested cushions</button>
+        <span class="muted" style="font-size:12.5px">sets each name's min expected-move cushion (tightening only)</span>
+      </div>
+      <div class="hint">From the per-name risk profile: names whose historical assignment rate at the base cushion runs above target get a wider <i>min_strike_expected_moves</i> override. Never loosens an existing override.</div>
+      <div class="say" id="tn-cush-say"></div>
 
       <div class="ctl-lab" style="margin-top:18px">Global screening</div>
       <div class="scr-filters">
@@ -1051,35 +1340,65 @@ _PAGE = """<!doctype html>
   </div>
 
   <div class="tabpane" id="pane-history" hidden>
+  <section class="card2">
+    <div class="card-h"><h2>Per-rule performance</h2></div>
     <div class="more-body">
-      <h3>Per-rule performance</h3>
       <table id="rules"><thead><tr><th>Rule</th><th class="num">Closes</th><th class="num">Wins</th>
         <th class="num">Win&nbsp;%</th><th class="num">Realized&nbsp;P&amp;L</th></tr></thead><tbody></tbody></table>
-      <h3>All positions</h3>
+    </div>
+  </section>
+  <section class="card2">
+    <div class="card-h"><h2>All positions</h2></div>
+    <div class="more-body">
       <table id="positions"><thead><tr><th>Symbol</th><th>Strategy</th><th>Status</th><th class="num">Qty</th>
         <th class="num">Credit</th><th class="num">Close</th><th class="num">P&amp;L</th><th class="num">DTE</th>
         <th>Outcome</th><th>Rule</th></tr></thead><tbody></tbody></table>
-      <h3>Decision log — the "why"</h3>
+    </div>
+  </section>
+  <section class="card2">
+    <div class="card-h"><h2>Decision log — the "why"</h2></div>
+    <div class="more-body">
       <table id="decisions"><thead><tr><th>When</th><th>Rule</th><th>Reason</th><th>Approval</th><th>Status</th>
         </tr></thead><tbody></tbody></table>
-      <h3>Opportunities — latest CSP scan</h3>
+    </div>
+  </section>
+  <section class="card2" data-fold="closed">
+    <div class="card-h"><h2>Opportunities — latest CSP scan</h2></div>
+    <div class="more-body">
       <table id="candidates"><thead><tr><th>Symbol</th><th class="num">Strike</th><th class="num">DTE</th>
         <th class="num">&Delta;</th><th class="num">Premium</th><th class="num">Ann&nbsp;%</th>
         <th class="num">OI</th><th class="num">IVR</th></tr></thead><tbody></tbody></table>
-      <h3>Holdings — shares &amp; covered-call coverage</h3>
+    </div>
+  </section>
+  <section class="card2" data-fold="closed">
+    <div class="card-h"><h2>Holdings — shares &amp; covered-call coverage</h2></div>
+    <div class="more-body">
       <table id="holdings"><thead><tr><th>Symbol</th><th class="num">Shares</th><th class="num">Cost basis</th>
-        <th class="num">Coverable</th><th class="num">Covered</th></tr></thead><tbody></tbody></table>
-      <h3>CC opportunities — calls on shares you hold</h3>
+        <th class="num">Coverable</th><th class="num">Covered</th><th>Note</th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+  <section class="card2" data-fold="closed">
+    <div class="card-h"><h2>CC opportunities — calls on shares you hold</h2></div>
+    <div class="more-body">
       <table id="cc-candidates"><thead><tr><th>Symbol</th><th class="num">Strike</th><th class="num">DTE</th>
         <th class="num">&Delta;</th><th class="num">Premium</th><th class="num">Ann&nbsp;%</th></tr></thead><tbody></tbody></table>
-      <h3>Entry log — auto-entered CSPs &amp; CCs</h3>
+    </div>
+  </section>
+  <section class="card2" data-fold="closed">
+    <div class="card-h"><h2>Entry log — auto-entered CSPs &amp; CCs</h2></div>
+    <div class="more-body">
       <table id="entries"><thead><tr><th>When</th><th>Symbol</th><th class="num">Qty</th><th class="num">Strike</th>
         <th class="num">Premium</th><th>Status</th></tr></thead><tbody></tbody></table>
-      <h3>Trade journal — labeled entries + outcomes (learning data)</h3>
+    </div>
+  </section>
+  <section class="card2" data-fold="closed">
+    <div class="card-h"><h2>Trade journal — labeled entries + outcomes (learning data)</h2></div>
+    <div class="more-body">
       <table id="journal"><thead><tr><th>Entered</th><th>Kind</th><th>Symbol</th><th class="num">&Delta;</th>
         <th class="num">DTE</th><th class="num">IV</th><th class="num">Premium</th><th>Status</th>
         <th class="num">P&amp;L</th></tr></thead><tbody></tbody></table>
     </div>
+  </section>
   </div>
 
   <div class="foot">Read-only monitoring · settings changes are logged · powered by AgenticRobinhood</div>
@@ -1093,6 +1412,8 @@ const money = (v) => v == null ? "—"
   : (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
 const cls = (v) => v == null ? "muted" : v > 0 ? "pos-c" : v < 0 ? "neg" : "";
 const pct = (v) => v == null ? "—" : (v*100).toFixed(0) + "%";
+const human = (l) => String(l == null ? "" : l).split("_").join(" ");
+const biasPill = (b) => { const k = b==="favorable"?"fav":(b==="avoid"?"avoid":(b==="mixed"?"mixed":"")); return `<span class="pill ${k}">${esc(b||"none")}</span>`; };
 async function getJSON(u){ const r = await fetch(u,{credentials:"same-origin"}); if(!r.ok) throw new Error(u+" -> "+r.status); return r.json(); }
 function tickerLogo(sym){
   const s = esc(sym);
@@ -1113,7 +1434,16 @@ async function loadConn(){
     const nd=$("nav-status"); if(nd) nd.className="nav-dot bad"; return;
   }
   try { bs = await getJSON("/control/broker-status"); } catch(e){ bs = {ok:false}; }
+  let sc = null; try { sc = await getJSON("/api/scan-status"); } catch(e){ sc = null; }
   const paper = bs.is_paper === true, live = st.mode === "live";
+  let scanChip = "";
+  if(sc){
+    const lastAgo = sc.last_scan_at ? agoStr((Date.now()-new Date(sc.last_scan_at).getTime())/1000) : null;
+    scanChip = sc.market_open
+      ? `<span class="chip good">Market open · scanning${lastAgo?" <b>"+esc(lastAgo)+"</b>":""}</span>`
+      : `<span class="chip">Market closed${lastAgo?" · last scan <b>"+esc(lastAgo)+"</b>":""}</span>`;
+    if(sc.last_error) scanChip += `<span class="chip warn" title="${esc(sc.last_error)}">scan error</span>`;
+  }
   let klass="", label="", sub="";
   if(bs.read_error){ klass="bad"; label="Broker connection problem"; sub="· "+bs.read_error; }
   else if(paper && live){ klass="bad"; label="Running on the SIMULATOR"; sub="· not trading your real account"; }
@@ -1124,6 +1454,7 @@ async function loadConn(){
     <div class="chips">
       <span class="chip ${live?"good":""}">${live?"Live trading armed":"Paper mode"}</span>
       <span class="chip ${st.paused?"warn":""}">${st.paused?"⏸ Paused":"Running"}</span>
+      ${scanChip}
       ${bs.buying_power!=null?`<span class="chip">Buying power <b>${money(bs.buying_power)}</b></span>`:""}
       ${bs.open_positions!=null?`<span class="chip">${bs.open_positions} open</span>`:""}
     </div>`;
@@ -1195,6 +1526,61 @@ async function loadWeek(){
     <div class="stat"><span class="k">Open now</span><span class="v">${s.open_count}</span></div>
     <div class="stat"><span class="k">Unrealized</span><span class="v ${cls(s.unrealized_pnl)}">${money(s.unrealized_pnl)}</span></div>
     <div class="wkline"><span class="wklbl">This week</span> ${wk}</div>`;
+}
+
+/* ---- tax reserve + capital unlocks ---- */
+function dayName(i){ return ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][i] || ""; }
+async function loadReserve(){
+  const el = $("reserve"); if(!el) return;
+  const d = await getJSON("/api/tax-reserve");
+  const cfg = d.config || {}, h = d.holding, t = d.totals || {}, st = d.status || {};
+  if($("rsv-note")) $("rsv-note").textContent = cfg.enabled ? (cfg.dry_run ? "on · dry run" : "on") : "off";
+  const when = st.next_sweep_at ? new Date(st.next_sweep_at).toLocaleString(undefined,{weekday:"short",month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}) : "—";
+  const last = (d.recent||[])[0];
+  el.innerHTML = `
+    <div class="stat"><span class="k">Held in ${esc(cfg.symbol||"SGOV")}</span><span class="v">${h ? money(h.value) : "$0.00"}</span></div>
+    <div class="stat"><span class="k">Swept to date</span><span class="v">${money(t.swept_dollars||0)} <span class="badge">${t.sweeps||0} sweeps</span></span></div>
+    <div class="stat"><span class="k">Net realized since last sweep</span><span class="v ${cls(st.pending_net_since_last)}">${money(st.pending_net_since_last)}</span></div>
+    <div class="stat"><span class="k">Next sweep would buy</span><span class="v">${money(st.would_sweep||0)}</span></div>
+    <div class="wkline"><span class="wklbl">Next</span> ${esc(when)}${cfg.enabled ? "" : " · turn on in Tuning"}${last ? ` · last: ${esc(last.status)} ${last.dollar_amount ? money(last.dollar_amount) : ""}` : ""}</div>`;
+}
+async function loadTiers(){
+  const el = $("tiers"); if(!el) return;
+  const d = await getJSON("/api/tiers");
+  const ready = d.ready || [];
+  if($("tiers-note")) $("tiers-note").textContent = ready.length ? ready.length + " fit the per-name cap" : "none yet";
+  const nxt = d.next ? `<div class="hint">Next unlock: <b>${esc(d.next.symbol)}</b> needs about ${money(d.next.account_value_needed)} of account value (one contract = ${money(d.next.collateral)}).</div>` : "";
+  el.innerHTML = (ready.length ? ready.map(r => `<div class="row" style="margin-bottom:6px"><span class="wl-tag">${esc(r.symbol)}</span>
+      <span class="muted" style="font-size:12.5px;flex:1">${money(r.collateral)} per contract · cap ${money(r.per_name_cap)}${r.note ? " · " + esc(r.note) : ""}</span>
+      <button class="go" data-add="${esc(r.symbol)}" data-pt='${esc(JSON.stringify(r.per_ticker||{}))}'>Add</button></div>`).join("")
+    : `<div class="muted" style="font-size:12.5px">Quality names from the community list appear here once one contract fits under the per-name cap. Nothing is added without a tap.</div>`) + nxt
+    + `<div class="say" id="tiers-say"></div>`;
+  el.querySelectorAll("button[data-add]").forEach(b => b.onclick = async () => {
+    const sym = b.dataset.add; let pt = {}; try { pt = JSON.parse(b.dataset.pt||"{}"); } catch(e){}
+    try { const cfg = await getJSON("/api/config"); const wl = (cfg.editable.entry.watchlist||[]).concat([sym]);
+      await postConfig({entry:{watchlist: wl, per_ticker: {[sym]: pt}}});
+      say("tiers-say", "Added "+sym+" with its tier overrides.", true); await loadControls(); await loadTiers();
+    } catch(e){ say("tiers-say", "Couldn't add: "+e.message, false); }
+  });
+}
+function fillReserve(tr){
+  if(document.activeElement !== $("tn-tr-on")) $("tn-tr-on").checked = !!tr.enabled;
+  if(document.activeElement !== $("tn-tr-dry")) $("tn-tr-dry").checked = tr.dry_run !== false;
+  _setIf("tn-tr-pct", tr.pct != null ? (tr.pct*100).toFixed(0) : "20");
+  _setIf("tn-tr-sym", tr.symbol || "SGOV");
+  _setIf("tn-tr-day", tr.weekday != null ? String(tr.weekday) : "4");
+  _setIf("tn-tr-time", (tr.hour != null ? String(tr.hour).padStart(2,"0") : "15") + ":" + (tr.minute != null ? String(tr.minute).padStart(2,"0") : "40"));
+}
+async function saveReserve(){
+  const pct = parseFloat(($("tn-tr-pct").value||"").trim()); const sym = ($("tn-tr-sym").value||"").trim().toUpperCase();
+  const tm = ($("tn-tr-time").value||"15:40").trim().split(":"); const hh = parseInt(tm[0],10), mm = parseInt(tm[1]||"0",10);
+  if(isNaN(pct) || pct <= 0 || pct > 60){ say("tn-tr-say","Enter a percent between 1 and 60.",false); return; }
+  if(!/^[A-Z]{1,6}$/.test(sym)){ say("tn-tr-say","Enter a stock or ETF ticker, e.g. SGOV.",false); return; }
+  if(isNaN(hh) || isNaN(mm) || hh < 9 || hh > 15 || (hh === 9 && mm < 35)){ say("tn-tr-say","Time must be inside market hours (09:35 to 15:55 ET).",false); return; }
+  try { await postConfig({tax_reserve:{enabled:$("tn-tr-on").checked, dry_run:$("tn-tr-dry").checked, pct: pct/100, symbol: sym, weekday: parseInt($("tn-tr-day").value,10), hour: hh, minute: mm}});
+    say("tn-tr-say", $("tn-tr-on").checked ? (($("tn-tr-dry").checked ? "On (dry run): " : "On: ") + pct + "% of net gains into " + sym + " every " + dayName(parseInt($("tn-tr-day").value,10)) + ".") : "Off.", true);
+    await loadReserve();
+  } catch(e){ say("tn-tr-say","Couldn't save: "+e.message,false); }
 }
 
 /* ---- activity ---- */
@@ -1319,6 +1705,30 @@ async function loadControls(){
   const wt = e.weekly_premium_target_pct;
   if(document.activeElement !== $("wk-in")) $("wk-in").value = wt ? (wt*100).toFixed(wt*100 % 1 ? 1 : 0) : "0";
   fillTuning(e);
+  fillMacro(cfg.editable.macro || {});
+  fillReserve(cfg.editable.tax_reserve || {});
+}
+function fillMacro(m){
+  if(document.activeElement !== $("tn-skip-dt")) $("tn-skip-dt").checked = !!m.skip_confirmed_downtrend;
+  _setIf("tn-dt-days", m.downtrend_confirm_days != null ? m.downtrend_confirm_days : 5);
+}
+async function saveDowntrend(){
+  const raw=($("tn-dt-days").value||"").trim(); const d=parseInt(raw||"5",10);
+  if(isNaN(d) || d<1 || d>60){ say("tn-dt-say","Enter 1-60 sessions.",false); return; }
+  try { await postConfig({macro:{skip_confirmed_downtrend:$("tn-skip-dt").checked, downtrend_confirm_days:d}});
+    say("tn-dt-say", $("tn-skip-dt").checked ? ("On: new puts pause after "+d+" sessions below the 200-day.") : "Off: regime is informational only.", true);
+    await loadRegimeStatus();
+  } catch(e){ say("tn-dt-say","Couldn't save: "+e.message,false); }
+}
+async function loadRegimeStatus(){
+  const el = $("tn-dt-status"); if(!el) return;
+  try {
+    const d = await getJSON("/api/regime"); const r = d.regime || {};
+    if(r.spy_days_below_sma200 == null){ el.textContent = "SPY vs 200-day: not computed yet (first scan)."; return; }
+    const on = d.skip_confirmed_downtrend;
+    const state = r.spy_days_below_sma200 > 0 ? ("SPY has closed below its 200-day for "+r.spy_days_below_sma200+" session"+(r.spy_days_below_sma200===1?"":"s")) : "SPY is above its 200-day";
+    el.innerHTML = `<span>${esc(state)}</span> <span class="pill ${r.confirmed_downtrend ? (on ? "avoid" : "mixed") : "fav"}">${r.confirmed_downtrend ? (on ? "new puts paused" : "confirmed downtrend (gate off)") : "clear"}</span> <span class="muted">regime: ${esc(r.label||"?")}${r.vix!=null?" · VIX "+Number(r.vix).toFixed(1):""}</span>`;
+  } catch(e){ el.textContent = ""; }
 }
 function _setIf(id, v){ if(document.activeElement !== $(id)) $(id).value = (v==null ? "" : v); }
 function fillTuning(e){
@@ -1327,6 +1737,9 @@ function fillTuning(e){
   _setIf("tn-uc", uc!=null ? (uc*100).toFixed(uc*100 % 1 ? 1 : 0) : "0");
   _setIf("tn-em", cr.min_strike_expected_moves);
   _setIf("tn-vrp", cr.min_iv_rv_ratio);
+  _setIf("tn-avoid", (cr.avoid_setups||[]).join(", "));
+  _setIf("tn-require", (cr.require_setups||[]).join(", "));
+  if(document.activeElement !== $("tn-prefer-setups")) $("tn-prefer-setups").checked = !!e.prefer_setups;
   _setIf("tn-dmin", cr.delta_min);
   _setIf("tn-dmax", cr.delta_max);
   if(document.activeElement !== $("tn-ivrank")) $("tn-ivrank").checked = !!e.prefer_iv_rank;
@@ -1352,6 +1765,16 @@ async function saveGates(){
   try { await postConfig({entry:{criteria:{min_strike_expected_moves:_numOrNull("tn-em"), min_iv_rv_ratio:_numOrNull("tn-vrp")}}});
     say("tn-gates-say","Gates saved.",true);
   } catch(e){ say("tn-gates-say","Couldn't save: "+e.message,false); }
+}
+function _labels(id){
+  const r=($(id).value||"").trim(); if(!r) return null;
+  const L=r.split(",").map(s=>s.trim().toLowerCase()).filter(Boolean); return L.length?L:null;
+}
+async function saveSetupGates(){
+  try { await postConfig({entry:{prefer_setups:$("tn-prefer-setups").checked,
+                                 criteria:{avoid_setups:_labels("tn-avoid"), require_setups:_labels("tn-require")}}});
+    say("tn-setups-say","Setup gates saved.",true);
+  } catch(e){ say("tn-setups-say","Couldn't save: "+e.message,false); }
 }
 async function saveGlobal(){
   const dmin=_numOrNull("tn-dmin"), dmax=_numOrNull("tn-dmax");
@@ -1445,10 +1868,14 @@ async function loadTables(){
     <td class="num">${c.iv_rank!=null?c.iv_rank.toFixed(0):"—"}</td></tr>`).join("")
     || `<tr><td colspan="8" class="muted">no scan yet</td></tr>`;
   const {holdings} = await getJSON("/api/holdings");
-  $("holdings").querySelector("tbody").innerHTML = holdings.map(h => `<tr>
-    <td>${esc(h.symbol)}</td><td class="num">${h.shares}</td><td class="num">${money(h.average_cost)}</td>
-    <td class="num">${h.coverable}</td><td class="num">${h.covered}/${h.coverable}</td></tr>`).join("")
-    || `<tr><td colspan="5" class="muted">no share holdings</td></tr>`;
+  $("holdings").querySelector("tbody").innerHTML = holdings.map(h => {
+    const c = h.clock || {};
+    const note = h.reserve ? '<span class="pill fav">tax reserve</span>'
+      : (c.days_held != null ? (c.below_basis_allowed ? `<span class="pill mixed">stuck ${c.days_held}d · calls below basis allowed</span>`
+         : `<span class="pill">held ${c.days_held}d${c.under_water ? " · under water" : ""}${c.clock_days ? " · clock " + c.clock_days + "d" : ""}</span>`) : "");
+    return `<tr><td>${esc(h.symbol)}</td><td class="num">${h.shares}</td><td class="num">${money(h.average_cost)}</td>
+    <td class="num">${h.coverable}</td><td class="num">${h.covered}/${h.coverable}</td><td>${note}</td></tr>`; }).join("")
+    || `<tr><td colspan="6" class="muted">no share holdings</td></tr>`;
   const cc = await getJSON("/api/cc-candidates");
   $("cc-candidates").querySelector("tbody").innerHTML = cc.candidates.map(c => `<tr>
     <td>${esc(c.underlying)} ${c.strike}C</td><td class="num">${c.strike}</td><td class="num">${c.dte}</td>
@@ -1472,6 +1899,116 @@ async function loadTables(){
     || `<tr><td colspan="9" class="muted">no journaled trades yet</td></tr>`;
 }
 
+async function loadSetups(){
+  const d = await getJSON("/api/setups");
+  const tb = $("setups-tbl").querySelector("tbody");
+  const note = $("setups-note");
+  if(!d.enabled){
+    if(note) note.textContent = "off";
+    tb.innerHTML = `<tr><td colspan="11" class="muted">Setup detection is off (entry.setups.enabled).</td></tr>`;
+    return;
+  }
+  const c = d.counts || {};
+  if(note) note.textContent = (c.favorable||0)+" favorable · "+(c.avoid||0)+" avoid · "+(c.mixed||0)+" mixed";
+  const rows = d.symbols || [];
+  if(!rows.length){
+    tb.innerHTML = `<tr><td colspan="11" class="muted">Waiting for the next scan.</td></tr>`;
+    return;
+  }
+  const n1 = (x,dp)=> x!=null ? Number(x).toFixed(dp==null?1:dp) : "—";
+  const AV = ["breakdown_confirmed","support_break","breakdown","falling_knife","breakout_from_base",
+              "breakout_followthrough","climax_breakout","breakout_confirmed","breakout_strong","breakout"];
+  const FV = ["support_test_rejection","support_test_on_volume","quiet_base","washout_at_support","washout"];
+  const lblChip = (l)=> `<span class="lbl ${AV.includes(l)?"avoid":(FV.includes(l)?"fav":"")}">${esc(human(l))}</span>`;
+  tb.innerHTML = rows.map(r=>{
+    const f = r.features||{}, lv = r.live||{};
+    const live = lv.breakout_attempt ? '<span class="pill up">breakout attempt</span>'
+               : lv.breakdown_attempt ? '<span class="pill live">breakdown attempt</span>'
+               : lv.support_break_attempt ? '<span class="pill live">support break</span>'
+               : (r.partial_bar ? '<span class="pill">quiet</span>' : "—");
+    const sup = f.support_ref!=null ? n1(f.support_ref,2)+(f.dist_to_support_pct!=null ? " ("+n1(f.dist_to_support_pct)+"%)" : "") : "—";
+    const res = f.resistance_ref!=null ? n1(f.resistance_ref,2)+(f.dist_to_resistance_pct!=null ? " ("+n1(f.dist_to_resistance_pct)+"%)" : "") : "—";
+    const gate = (r.gate && r.gate.blocked) ? ` <span class="tvstale" title="${esc(r.gate.reason||"")}">gated</span>` : "";
+    const tvb = (r.tv && r.tv.present) ? ` <span class="count" title="TradingView flags merged: ${esc((r.tv.sources||[]).join(", ")||"context")}">TV</span>` : "";
+    return `<tr><td><b>${esc(r.symbol)}</b>${gate}${tvb}</td><td class="num">${r.price!=null?money(r.price):"—"}</td>
+      <td style="white-space:normal;min-width:160px">${(r.setups||[]).map(lblChip).join("") || '<span class="muted">none</span>'}</td>
+      <td>${biasPill(r.bias)}</td><td>${live}</td>
+      <td class="num">${n1(f.rsi,0)}</td><td class="num">${n1(f.bb_percent_b,0)}</td><td class="num">${n1(f.bb_width_pct)}</td>
+      <td class="num">${f.vol_ratio_20!=null ? n1(f.vol_ratio_20)+"×" : "n/a"}</td>
+      <td class="num">${sup}</td><td class="num">${res}</td></tr>`;
+  }).join("");
+}
+async function loadSetupAccuracy(){
+  const d = await getJSON("/api/setups/accuracy");
+  const tb = $("setups-acc-tbl").querySelector("tbody");
+  const note = $("setups-acc-note");
+  const rows = (d.rows||[]);
+  if(!d.available || !rows.length){
+    if(note) note.textContent = d.available ? "no resolved fires yet" : "tracker off";
+    return;
+  }
+  const resolved = rows.reduce((a,r)=>a+(r.n||0),0), pend = rows.reduce((a,r)=>a+(r.n_pending||0),0);
+  if(note) note.textContent = resolved+" resolved · "+pend+" pending";
+  const pc = (v)=> v!=null ? (v*100).toFixed(1)+"%" : "—";
+  const hr = (v)=> v!=null ? (v*100).toFixed(0)+"%" : "—";
+  tb.innerHTML = rows.map(r=>{
+    const ne = (r.n_ep!=null) ? r.n_ep : r.n;              // episodes = the honest count
+    const weak = (ne||0) < 15;
+    return `<tr class="${weak?"muted":""}"><td>${esc(human(r.label))}${r.source && r.source!=="bot_daily" ? ' <span class="muted">('+esc(r.source)+')</span>' : ""}</td>
+      <td>${biasPill(r.bias)}</td><td class="num">${r.n}</td><td class="num"><b>${ne!=null?ne:"—"}</b></td><td class="num">${hr(r.hit_rate_5d)}</td>
+      <td class="num ${cls(r.avg_ret_5d)}">${pc(r.avg_ret_5d)}</td><td class="num ${cls(r.avg_ret_10d)}">${pc(r.avg_ret_10d)}</td>
+      <td class="num neg">${pc(r.avg_mae_10d)}</td><td class="num">${r.n_pending||0}</td></tr>`;
+  }).join("");
+}
+let riskProfile = null;
+async function loadRiskProfile(){
+  const d = await getJSON("/api/risk-profile");
+  riskProfile = d;
+  const c = d.config || {};
+  if($("rp-base")) $("rp-base").textContent = c.base_cushion; if($("rp-h")) $("rp-h").textContent = c.horizon;
+  if($("rp-target")) $("rp-target").textContent = c.target_itm_rate!=null ? (c.target_itm_rate*100).toFixed(0)+"%" : "";
+  const tb = $("rp-tbl").querySelector("tbody");
+  const rows = d.profiles || [];
+  if($("rp-note")) $("rp-note").textContent = rows.length ? rows.length+" names · "+(d.proposals||[]).length+" suggestions" : "";
+  if(!rows.length){ tb.innerHTML = `<tr><td colspan="7" class="muted">Profiles compute on each name's first scan of the day.</td></tr>`; }
+  else {
+    const pc = (v)=> v!=null ? (v*100).toFixed(1)+"%" : "—";
+    tb.innerHTML = rows.map(p=>{
+      const note = !p.reliable ? '<span class="pill">thin history</span>' : (p.needs_tightening ? '<span class="pill mixed">wider cushion</span>' : '<span class="pill fav">ok at base</span>');
+      return `<tr><td><b>${esc(p.symbol||"")}</b></td><td class="num">${p.n}</td>
+        <td class="num">${pc(p.touch_rate)}</td><td class="num">${pc(p.itm_rate)}</td><td class="num neg">${pc(p.avg_worst_pct)}</td>
+        <td class="num">${p.suggested_cushion!=null ? p.suggested_cushion+"σ" : "—"}</td><td>${note}</td></tr>`;
+    }).join("");
+  }
+  const props = d.proposals || [];
+  if($("tn-cush-note")) $("tn-cush-note").textContent = props.length ? "("+props.length+" suggested)" : "";
+  if($("tn-cush-list")) $("tn-cush-list").innerHTML = props.length
+    ? props.map(p=>`<div><b>${esc(p.symbol)}</b>: ${p.current!=null?p.current:"none"} → <b>${p.proposed}σ</b> <span class="muted">— ${esc(p.reason)}</span></div>`).join("")
+    : `<span class="muted" style="font-size:12px">No names need a wider cushion right now.</span>`;
+}
+async function applyPutSellerPreset(){
+  try {
+    const d = riskProfile || await getJSON("/api/risk-profile");
+    const preset = ((d.config||{}).put_seller_avoid_preset)||[];
+    if(!preset.length){ say("tn-setups-say","Preset unavailable.",false); return; }
+    const cur = _labels("tn-avoid") || [];
+    const merged = Array.from(new Set(cur.concat(preset)));
+    $("tn-avoid").value = merged.join(", ");
+    await saveSetupGates();
+  } catch(e){ say("tn-setups-say","Couldn't apply preset: "+e.message,false); }
+}
+async function applySuggestedCushions(){
+  try {
+    const d = riskProfile || await getJSON("/api/risk-profile");
+    const props = d.proposals || [];
+    if(!props.length){ say("tn-cush-say","Nothing to apply — no name needs a wider cushion.",true); return; }
+    const per = {};
+    props.forEach(p => { per[p.symbol] = {min_strike_expected_moves: p.proposed}; });
+    await postConfig({entry:{per_ticker: per}});
+    say("tn-cush-say","Applied wider cushions for "+props.map(p=>p.symbol).join(", ")+".",true);
+    await loadControls(); await loadRiskProfile();
+  } catch(e){ say("tn-cush-say","Couldn't apply: "+e.message,false); }
+}
 async function loadQuality(){
   const d = await getJSON("/api/quality");
   const tb = $("quality-tbl").querySelector("tbody");
@@ -1512,11 +2049,50 @@ function mdLite(s){
     return "<div>"+bold(line)+"</div>";
   }).join("");
 }
-async function loadBrief(){
-  const el = $("brief-body");
+let briefShown = null;   // id of the brief currently on screen (null = none yet)
+function briefWhen(iso){
+  if(!iso) return "";
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"})+" "+d.toLocaleTimeString(undefined,{hour:"numeric",minute:"2-digit"});
+}
+function showBrief(d, note){
+  const el = $("brief-body"), meta = $("brief-meta");
+  el.classList.remove("muted");
+  el.innerHTML = mdLite(d.body||"");
+  briefShown = d.id || "unsaved";
+  const m = d.meta || {};
+  meta.innerHTML = [
+    d.created_at ? `<span>Generated <b>${esc(briefWhen(d.created_at))}</b></span>` : "",
+    `<span>${d.has_ai ? "AI tactical read included" : "Deterministic read (no AI)"}</span>`,
+    m.open_positions!=null ? `<span><b>${m.open_positions}</b> open at the time</span>` : "",
+    note ? `<span class="muted">${esc(note)}</span>` : "",
+  ].filter(Boolean).join("");
+  const sel = $("brief-list"); if(sel && d.id) sel.value = d.id;
+}
+async function generateBrief(){
+  const el = $("brief-body"), btn = $("brief-run");
   el.textContent = "Building brief… (reading your accounts live — a few seconds)";
-  try { const d = await getJSON("/api/brief"); el.innerHTML = mdLite(d.body||""); }
+  btn.disabled = true;
+  try { const d = await getJSON("/api/brief"); await loadBriefList(); showBrief(d, d.id ? "saved" : "not saved"); }
   catch(e){ el.textContent = "Failed to build brief: "+e.message; }
+  finally { btn.disabled = false; }
+}
+async function loadBriefList(){
+  const sel = $("brief-list"); if(!sel) return;
+  const d = await getJSON("/api/briefs?limit=40");
+  if(!d.available){ sel.hidden = true; return; }
+  const rows = d.briefs || [];
+  const cur = sel.value;
+  sel.innerHTML = `<option value="">${rows.length ? rows.length+" saved brief"+(rows.length===1?"":"s") : "No saved briefs yet"}</option>`
+    + rows.map(b => `<option value="${esc(b.id)}">${esc(briefWhen(b.created_at))}${b.has_ai?" · AI":""}</option>`).join("");
+  if(cur && rows.some(b=>b.id===cur)) sel.value = cur;
+  // First load: open on the latest saved brief instead of an empty pane.
+  if(briefShown === null && d.latest) showBrief(d.latest, "latest saved");
+}
+async function openSavedBrief(id){
+  if(!id) return;
+  try { const d = await getJSON("/api/briefs/"+encodeURIComponent(id)); showBrief(d, "saved"); }
+  catch(e){ $("brief-meta").textContent = "Couldn't load that brief: "+e.message; }
 }
 
 /* ---- orchestration ---- */
@@ -1524,7 +2100,9 @@ let lastLoad = 0;
 async function loadAll(){
   for (const [fn,name] of [[loadConn,"conn"],[loadHolds,"holds"],[loadWeek,"week"],
                            [loadFeed,"feed"],[loadScanStatus,"scan"],[loadTvLevels,"tv"],
-                           [loadQuality,"quality"],[loadTables,"tables"]]) {
+                           [loadQuality,"quality"],[loadSetups,"setups"],[loadSetupAccuracy,"setupacc"],
+                           [loadRiskProfile,"riskprofile"],[loadRegimeStatus,"regime"],
+                           [loadReserve,"reserve"],[loadTiers,"tiers"],[loadTables,"tables"]]) {
     try { await fn(); } catch(e){ console.error(name, e); }
   }
   lastLoad = Date.now();
@@ -1534,7 +2112,9 @@ function tickAgo(){
   const s = Math.round((Date.now()-lastLoad)/1000);
   $("ago").textContent = s < 5 ? "Updated just now" : "Updated " + s + "s ago";
 }
-$("brief-run").onclick = loadBrief;
+$("brief-run").onclick = generateBrief;
+$("brief-list").onchange = (e) => openSavedBrief(e.target.value);
+loadBriefList().catch(e=>console.error("briefs",e));
 $("scr-run").onclick = runScreen;
 $("scr-scan").onclick = runScan;
 $("wl-add").onclick = addTicker;
@@ -1542,9 +2122,33 @@ $("wl-in").addEventListener("keydown", e => { if(e.key==="Enter") addTicker(); }
 $("wk-save").onclick = saveWeekly;
 $("wk-in").addEventListener("keydown", e => { if(e.key==="Enter") saveWeekly(); });
 $("tn-uc-save").onclick = saveMulti;
+$("tn-dt-save").onclick = saveDowntrend;
+$("tn-tr-save").onclick = saveReserve;
 $("tn-gates-save").onclick = saveGates;
 $("tn-global-save").onclick = saveGlobal;
 $("tn-pt-save").onclick = savePerTicker;
+$("tn-setups-save").onclick = saveSetupGates;
+$("tn-preset-putseller").onclick = applyPutSellerPreset;
+$("tn-cush-apply").onclick = applySuggestedCushions;
+
+/* ---- collapsible cards: tap a card title to fold it; remembered per device ---- */
+(function initCollapsibles(){
+  document.querySelectorAll(".card2").forEach(card => {
+    const h = card.querySelector(":scope > .card-h"); const t = h && h.querySelector("h2");
+    if(!h || !t || card.dataset.nofold) return;
+    const key = "tc_fold_" + t.textContent.trim().toLowerCase().split(" ").join("-").slice(0,40);
+    h.classList.add("clp"); t.insertAdjacentHTML("afterbegin", '<span class="chev"></span>');
+    let closed = card.dataset.fold === "closed";
+    try { const v = localStorage.getItem(key); if(v !== null) closed = (v === "1"); } catch(e){}
+    card.classList.toggle("collapsed", closed);
+    h.addEventListener("click", (e) => {
+      if(e.target.closest("button,a,select,input,label")) return;
+      const now = !card.classList.contains("collapsed");
+      card.classList.toggle("collapsed", now);
+      try { localStorage.setItem(key, now ? "1" : "0"); } catch(e){}
+    });
+  });
+})();
 
 /* ---- tab navigation ---- */
 function showTab(name){

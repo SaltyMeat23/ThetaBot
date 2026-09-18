@@ -30,6 +30,14 @@ SCANNER_CONSUMED = frozenset({"support", "adx", "bb_percent_b"})
 SCANNER_CONTEXT = frozenset({"resistance"})
 # The keys reconciliation checks for drift/naming (structural S/R + gated technicals).
 EXPECTED_KEYS = SCANNER_CONSUMED | SCANNER_CONTEXT
+# Setup flags (entry/setups.py real-time layer): the Daily exporter emits the un-prefixed keys and
+# a NEW intraday "Setup Exporter" emits the i_-prefixed ones. Consumed by scanner._enrich_ctx_from_tv
+# via setups.parse_tv_setups (freshness keyed on d_bar_time / i_bar_time). Kept separate from
+# EXPECTED_KEYS so reconciliation drift checks are unchanged; the Pine contract test uses the union.
+SETUP_CONSUMED = frozenset({
+    "squeeze_on", "breakout", "breakdown", "vol_ratio_20", "d_bar_time",
+    "i_tf", "i_bar_time", "i_breakout_attempt", "i_breakdown_attempt", "i_support_test", "i_vol_anomaly",
+})
 
 # Common variants an exporter might emit instead of the canonical key. Used to distinguish a
 # genuinely missing value from one that arrived under a name the gate never reads.

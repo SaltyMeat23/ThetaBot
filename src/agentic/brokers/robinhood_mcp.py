@@ -70,6 +70,9 @@ _ROLE_HINTS: dict[str, tuple[tuple[str, ...], ...]] = {
     "option_instruments": (("option", "instrument"),),
     "get_portfolio": (("portfolio",),),
     "equity_positions": (("equity", "position"),),
+    "place_equity_order": (("equity", "order", "place"), ("place", "equity", "order")),
+    "review_equity_order": (("equity", "order", "review"), ("review", "equity", "order")),
+    "get_equity_orders": (("equity", "order", "get"), ("get", "equity", "order")),
 }
 
 # UUIDv5 namespace for deriving a stable RH ``ref_id`` from our (non-UUID) client_order_id.
@@ -153,6 +156,7 @@ class RobinhoodMCPBroker(ExecutionBroker):
             name="robinhood_mcp",
             supports_options_orders=self._supports_options,
             is_paper=False,
+            supports_equity_orders=bool(self._account_number and "place_equity_order" in self._roles),
             notes=note,
         )
 
@@ -382,6 +386,80 @@ class RobinhoodMCPBroker(ExecutionBroker):
         })
         rec = self._first_record(raw)
         return str(rec.get("id")) if rec.get("id") else None
+
+    # ---- share orders (tax reserve BUY only) -------------------------------------------------
+    def _build_equity_order_args(self, *, symbol: str, dollar_amount: float, ref_id: str) -> dict[str, Any]:
+        """Market BUY for a dollar amount, regular hours (the only session that fills market orders),
+        fractional shares allowed. Mirrors the verified place_equity_order schema."""
+        return {
+            "account_number": self._account_number,
+            "symbol": symbol.upper(),
+            "side": "buy",
+            "type": "market",
+            "dollar_amount": f"{dollar_amount:.2f}",
+            "time_in_force": "gfd",
+            "market_hours": "regular_hours",
+            "ref_id": ref_id,
+        }
+
+    @staticmethod
+    def _parse_equity_order(rec: dict[str, Any]) -> dict[str, Any]:
+        state = str(rec.get("state") or rec.get("status") or "").lower()
+        qty = rec.get("cumulative_quantity") or rec.get("filled_quantity") or rec.get("processed_quantity") or rec.get("quantity")
+        px = rec.get("average_price") or rec.get("avg_fill_price") or rec.get("price")
+        try:
+            qty = float(qty) if qty is not None else None
+        except (TypeError, ValueError):
+            qty = None
+        try:
+            px = float(px) if px is not None else None
+        except (TypeError, ValueError):
+            px = None
+        dollars = rec.get("executed_notional") or rec.get("dollar_amount")
+        if isinstance(dollars, dict):
+            dollars = dollars.get("amount")
+        try:
+            dollars = float(dollars) if dollars is not None else ((qty or 0.0) * (px or 0.0) or None)
+        except (TypeError, ValueError):
+            dollars = None
+        status = {"filled": "filled", "partially_filled": "partial", "partial": "partial",
+                  "cancelled": "cancelled", "canceled": "cancelled", "rejected": "rejected",
+                  "failed": "rejected"}.get(state, "submitted" if rec.get("id") else state or "unknown")
+        return {"order_id": str(rec.get("id") or rec.get("order_id") or "") or None, "status": status,
+                "shares": qty, "avg_price": px, "dollars": dollars, "raw_state": state}
+
+    async def submit_equity_order(self, *, symbol: str, side: str = "buy", dollar_amount: float | None = None,
+                                  quantity: float | None = None, order_type: str = "market",
+                                  ref_id: str | None = None, price_hint: float | None = None,
+                                  timeout_seconds: float = 90.0, poll_seconds: float = 3.0) -> dict[str, Any]:
+        """BUY shares for a dollar amount (tax reserve). Refuses anything else: no sells, no limit
+        orders, no quantity orders -- the reserve is only ever reduced by the operator."""
+        if side != "buy" or order_type != "market" or not dollar_amount or dollar_amount <= 0 or quantity:
+            raise RuntimeError("submit_equity_order only supports market BUY by dollar amount.")
+        role = self._roles.get("place_equity_order")
+        if not role or not self._account_number:
+            raise RuntimeError("Robinhood MCP did not expose place_equity_order (or account_number unset).")
+        args = self._build_equity_order_args(symbol=symbol, dollar_amount=float(dollar_amount),
+                                             ref_id=ref_id or str(uuid.uuid4()))
+        raw = await self._call_tool(role, args)
+        result = self._parse_equity_order(self._first_record(raw))
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        while result["status"] in ("submitted", "partial", "unknown") and result.get("order_id") \
+                and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(poll_seconds)
+            try:
+                result = await self.get_equity_order(result["order_id"])
+            except Exception as exc:  # noqa: BLE001 -- keep polling on a transient read error
+                log.warning("get_equity_order failed: %s", exc)
+        return result
+
+    async def get_equity_order(self, order_id: str) -> dict[str, Any]:
+        role = self._roles.get("get_equity_orders")
+        if not role:
+            raise RuntimeError("Robinhood MCP did not expose get_equity_orders.")
+        raw = await self._call_tool(role, {"account_number": self._account_number, "order_id": order_id})
+        rec = self._match_order_record(raw, order_id) or self._first_record(raw)
+        return self._parse_equity_order(rec)
 
     async def submit_open_order(self, order: Order) -> Order:
         """Submit a sell-to-open (CSP). Idempotent on order.client_order_id via ref_id."""

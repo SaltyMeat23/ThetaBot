@@ -39,9 +39,28 @@ class MarketRegime:
     spy_realized_vol: float | None = None   # annualized fraction — the realized-vol fear proxy
     vix: float | None = None                # live CBOE VIX level (implied vol, forward-looking)
     vix_state: str | None = None            # calm | elevated | stress (from VIX thresholds)
+    spy_days_below_sma200: int | None = None   # consecutive SPY closes below the 200-day (0 = above)
+    confirmed_downtrend: bool | None = None    # days_below >= cfg.downtrend_confirm_days
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def days_below_sma200(closes: list[float], max_look: int = 60) -> int | None:
+    """Consecutive most-recent closes strictly below their own 200-day SMA (walk-forward: each day
+    uses the SMA as of that day). None when fewer than 200 closes; capped at ``max_look``."""
+    if len(closes) < 200:
+        return None
+    n = 0
+    for end in range(len(closes), 0, -1):
+        if n >= max_look or end < 200:
+            break
+        window = closes[end - 200:end]
+        if closes[end - 1] < sum(window) / 200:
+            n += 1
+        else:
+            break
+    return n
 
 
 def _above_sma200(closes: list[float]) -> bool | None:
@@ -103,6 +122,10 @@ def build_market_regime(
         vix=vix,
         vix_state=_vix_state(vix, cfg),
     )
+    reg.spy_days_below_sma200 = days_below_sma200(spy_closes)
+    confirm = getattr(cfg, "downtrend_confirm_days", 5)
+    reg.confirmed_downtrend = (reg.spy_days_below_sma200 >= confirm
+                               if reg.spy_days_below_sma200 is not None else None)
     reg.label, reg.risk_off = _label(reg, cfg)
     return reg
 

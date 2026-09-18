@@ -47,6 +47,9 @@ class WebDeps:
     notifier: Any | None = None     # notify.base.Notifier (for /control/test-notify)
     entry_candidates: Any | None = None  # store.entry_candidates.EntryCandidateStore
     news: Any | None = None         # store.news.NewsStore (advisory news/catalyst channel)
+    briefs: Any | None = None       # store.briefs.BriefStore (saved weekly briefs)
+    tax_reserve: Any | None = None   # services.tax_reserve.TaxReserveLoop (status for the dashboard)
+    tax_reserve_store: Any | None = None  # store.tax_reserve.TaxReserveStore
 
 
 def create_app(deps: WebDeps) -> FastAPI:

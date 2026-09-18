@@ -122,8 +122,12 @@ class ReconcileLoop:
 
         # Snapshot equity holdings to detect assignment (a short put gone + shares appearing).
         equity_by_symbol: dict[str, int] = {}
+        from .holdings import reserve_symbols
+        reserve = reserve_symbols(self.settings)
         try:
             for h in await self.broker.get_equity_positions():
+                if h.symbol.upper() in reserve:
+                    continue
                 equity_by_symbol[h.symbol] = h.quantity
         except Exception as exc:  # noqa: BLE001 — equity read is best-effort
             log.warning("equity snapshot failed during reconcile: %s", exc)

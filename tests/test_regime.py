@@ -109,3 +109,24 @@ def test_no_vix_falls_back_to_realized_vol_proxy():
     calm = _calm_bars()
     reg = build_market_regime(calm, calm, CFG, vix=None)
     assert reg.vix is None and reg.label == "calm"
+
+
+def test_days_below_sma200_and_confirmed_downtrend():
+    from agentic.entry.regime import days_below_sma200
+    flat = [100.0] * 260
+    assert days_below_sma200(flat) == 0                       # equal to the SMA is not below
+    assert days_below_sma200([100.0] * 150) is None           # needs 200 closes
+    # 8 closes below a falling-into-range average: walk-forward count is 8
+    below = [100.0] * 252 + [90.0] * 8
+    assert days_below_sma200(below) == 8
+    # a bounce above the average on the last day resets the count
+    assert days_below_sma200([100.0] * 252 + [90.0] * 7 + [101.0]) == 0
+    reg = build_market_regime(_bars(below), _bars(below), CFG)
+    assert reg.spy_days_below_sma200 == 8 and reg.confirmed_downtrend is True
+    reg4 = build_market_regime(_bars([100.0] * 256 + [90.0] * 4), _bars(flat), CFG)
+    assert reg4.spy_days_below_sma200 == 4 and reg4.confirmed_downtrend is False
+    reg7 = build_market_regime(_bars([100.0] * 256 + [90.0] * 4), _bars(flat),
+                               RegimeConfig(downtrend_confirm_days=3))
+    assert reg7.confirmed_downtrend is True
+    assert build_market_regime([], [], CFG).confirmed_downtrend is None
+    assert "confirmed_downtrend" in reg.as_dict()

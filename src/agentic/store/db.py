@@ -155,6 +155,55 @@ CREATE TABLE IF NOT EXISTS entry_candidates (
 CREATE INDEX IF NOT EXISTS idx_entry_candidates_scan ON entry_candidates(scanned_at);
 CREATE INDEX IF NOT EXISTS idx_entry_candidates_occ ON entry_candidates(occ_symbol, scanned_at);
 
+CREATE TABLE IF NOT EXISTS setup_events (
+    id          TEXT PRIMARY KEY,
+    symbol      TEXT NOT NULL,
+    label       TEXT NOT NULL,            -- entry/setups.py composite label that fired
+    bar_date    TEXT NOT NULL,            -- ISO date of the COMPLETED bar it fired on
+    source      TEXT NOT NULL,            -- bot_daily | tv_daily | tv_intraday | replay
+    fired_at    TEXT NOT NULL,
+    fire_price  REAL NOT NULL,
+    features    TEXT NOT NULL,            -- JSON snapshot of the read's features at fire time
+    ret_5d      REAL,                     -- forward returns vs fire_price (fractions)
+    ret_10d     REAL,
+    mae_10d     REAL,                     -- worst excursion over 10 bars (<= 0): the put-seller's question
+    mfe_10d     REAL,                     -- best excursion over 10 bars (>= 0)
+    resolved_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_setup_events_dedup ON setup_events(symbol, label, bar_date, source);
+CREATE INDEX IF NOT EXISTS idx_setup_events_pending ON setup_events(resolved_at, symbol);
+
+CREATE TABLE IF NOT EXISTS briefs (
+    id          TEXT PRIMARY KEY,
+    created_at  TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,            -- markdown as rendered by the dashboard
+    has_ai      INTEGER NOT NULL DEFAULT 0,  -- 1 when the Claude tactical read was included
+    meta        TEXT NOT NULL DEFAULT '{}'   -- JSON: watchlist size, open positions, etc.
+);
+CREATE INDEX IF NOT EXISTS idx_briefs_created ON briefs(created_at);
+
+CREATE TABLE IF NOT EXISTS tax_reserve (
+    id              TEXT PRIMARY KEY,
+    created_at      TEXT NOT NULL,
+    period_start    TEXT NOT NULL,            -- previous sweep instant (UTC ISO)
+    period_end      TEXT NOT NULL,            -- this sweep instant (UTC ISO); one row per period
+    net_realized    REAL NOT NULL,            -- realized P&L closed in the period
+    carry_in        REAL NOT NULL DEFAULT 0,  -- loss carried into the period (<= 0)
+    carry_out       REAL NOT NULL DEFAULT 0,  -- balance carried out (loss, or a too-small gain)
+    amount_due      REAL NOT NULL DEFAULT 0,  -- pct * net when positive
+    symbol          TEXT NOT NULL,
+    dollar_amount   REAL,
+    shares          REAL,
+    fill_price      REAL,
+    broker_order_id TEXT,
+    ref_id          TEXT,
+    status          TEXT NOT NULL,            -- filled | skipped | dry_run | failed
+    error           TEXT,
+    meta            TEXT NOT NULL DEFAULT '{}'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tax_reserve_period ON tax_reserve(period_end);
+
 CREATE TABLE IF NOT EXISTS iv_history (
     symbol      TEXT NOT NULL,
     date        TEXT NOT NULL,               -- ISO date

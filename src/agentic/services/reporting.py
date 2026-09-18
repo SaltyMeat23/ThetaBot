@@ -80,11 +80,39 @@ def build_daily_digest(*, stats: dict, rows: list[dict], scanner, mode: str,
             lines.append(tv_line)
     if err:
         lines.append(f"! last error: {str(err)[:120]}")
+    rl = reserve_line(scanner)
+    if rl:
+        lines.append(rl)
     title = f"Bot daily · {len(open_rows)} open · {_money(stats.get('realized_pnl'))} realized"
     return title, "\n".join(lines)
 
 
-def build_weekly_report(*, stats: dict, rows: list[dict], cumulative: dict | None = None,
+def reserve_line(scanner) -> str | None:
+    """One line on the tax reserve: what's held, what's been swept, what the next sweep would do."""
+    if scanner is None:
+        return None
+    held = getattr(scanner, "last_reserve", None)
+    store = getattr(scanner, "tax_reserve_store", None)
+    tr = getattr(getattr(scanner, "settings", None), "tax_reserve", None)
+    if tr is None or not tr.enabled:
+        return None
+    parts = [f"Tax reserve: {_money(held['value']) if held else '$0.00'} in {tr.symbol}"]
+    try:
+        if store is not None:
+            t = store.totals()
+            parts.append(f"swept {_money(t['swept_dollars'])} over {t['sweeps']} sweep(s)")
+            last = store.last()
+            if last:
+                parts.append(f"last period {last['status']}"
+                             + (f" {_money(last.get('dollar_amount'))}" if last.get('dollar_amount') else ""))
+    except Exception:  # noqa: BLE001
+        pass
+    if tr.dry_run:
+        parts.append("DRY RUN")
+    return " · ".join(parts)
+
+
+def build_weekly_report(*, stats: dict, rows: list[dict], cumulative: dict | None = None, scanner=None,
                         ai_summary: str | None = None, days: int = 7) -> tuple[str, str]:
     """Weekly rollup. ``stats`` is the trailing-window rollup (realized/W-L/by-rule scoped to the
     last ``days``); ``cumulative`` (optional) adds a since-inception context line; ``ai_summary``
@@ -103,6 +131,9 @@ def build_weekly_report(*, stats: dict, rows: list[dict], cumulative: dict | Non
     for b in stats.get("by_rule", [])[:6]:
         lines.append(f"  {b['rule']}: {b['closes']}x, {b['wins']}W, {_money(b['realized_pnl'])}")
     lines.append(f"Open now: {len(open_rows)} · unrealized {_money(stats.get('unrealized_pnl'))}")
+    rl = reserve_line(scanner) if scanner is not None else None
+    if rl:
+        lines.append(rl)
     if cumulative is not None:
         cwr = cumulative.get("win_rate")
         lines.append(
@@ -132,7 +163,7 @@ async def _weekly_ai_summary(settings, week_stats, cumulative, rows) -> str | No
         return None
 
 
-async def render_weekly(settings, positions, orders, decisions, *, days: int = 7) -> tuple[str, str]:
+async def render_weekly(settings, positions, orders, decisions, *, days: int = 7, scanner=None) -> tuple[str, str]:
     """Build the weekly report (trailing window + cumulative context + AI narrative). Shared by the
     scheduled loop and the /control/preview-weekly endpoint so both render identically."""
     pos = positions.list_all()
@@ -145,7 +176,8 @@ async def render_weekly(settings, positions, orders, decisions, *, days: int = 7
     rows = position_rows(pos, ords, decs, real_only=real)
     ai_summary = await _weekly_ai_summary(settings, week_stats, cumulative, rows)
     return build_weekly_report(
-        stats=week_stats, rows=rows, cumulative=cumulative, ai_summary=ai_summary, days=days)
+        stats=week_stats, rows=rows, cumulative=cumulative, ai_summary=ai_summary, days=days,
+        scanner=scanner)
 
 
 class ReportingLoop:
@@ -207,7 +239,7 @@ class ReportingLoop:
                 if should_send_weekly(cur, self._last_weekly, cfg.weekly_report_weekday,
                                       cfg.daily_digest_hour, cfg.daily_digest_minute):
                     title, msg = await render_weekly(
-                        self.settings, self.positions, self.orders, self.decisions)
+                        self.settings, self.positions, self.orders, self.decisions, scanner=self.scanner)
                     await self.notifier.send(title, msg)
                     self._last_weekly = cur.date()
                     log.info("Sent weekly report.")

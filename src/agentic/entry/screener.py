@@ -100,6 +100,8 @@ def screen_candidates(
     option_type: str = "put",
     strike_floor: float | None = None,
     support_ceiling: float | None = None,
+    strike_ceiling: float | None = None,
+    ignore_delta: bool = False,
 ) -> list[EntryCandidate]:
     """Screen one underlying's chain, ranked by yield.
 
@@ -119,13 +121,15 @@ def screen_candidates(
             continue
         if support_ceiling is not None and c.strike > support_ceiling:
             continue
+        if strike_ceiling is not None and c.strike > strike_ceiling:
+            continue
         dte = c.dte(today)
         if dte < criteria.dte_min or dte > criteria.dte_max:
             continue
-        if c.delta is None:
+        if c.delta is None and not ignore_delta:
             continue
-        adelta = abs(c.delta)
-        if adelta < criteria.delta_min or adelta > criteria.delta_max:
+        adelta = abs(c.delta) if c.delta is not None else 0.0
+        if not ignore_delta and (adelta < criteria.delta_min or adelta > criteria.delta_max):
             continue
         premium = c.midpoint
         if premium is None or premium <= 0 or c.strike <= 0:

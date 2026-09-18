@@ -71,6 +71,9 @@ _DIMENSIONS: dict[str, Callable[[dict[str, Any]], Any]] = {
     "regime": lambda r: r.get("ai_regime_label"),
     "ai_recommendation": lambda r: r.get("ai_recommendation"),
     "exit_reason": lambda r: r.get("exit_reason"),
+    # technical setup active at entry (entry/setups.py) -- which patterns actually pay for these names
+    "primary_setup": lambda r: _ctx(r).get("primary_setup") or "none",
+    "setup_bias": lambda r: _ctx(r).get("setup_bias"),
 }
 
 

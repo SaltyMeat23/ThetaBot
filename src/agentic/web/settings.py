@@ -51,6 +51,7 @@ EDITABLE_TOP_LEVEL = frozenset({
     "news",
     "roll",
     "reporting",
+    "tax_reserve",
     "notify",
     "rules",
 })

@@ -210,3 +210,138 @@ def test_iv_rank_sort_key_unknown_is_neutral_not_penalized():
     a = SimpleNamespace(underlying="A", theta_efficiency=0.003)
     b = SimpleNamespace(underlying="B", theta_efficiency=0.007)
     assert sorted([a, b], key=lambda c: iv_rank_sort_key(c, ctxs), reverse=True) == [b, a]
+
+
+# --- technical setup detection (entry/setups.py) integration -----------------------------------
+
+@pytest.mark.asyncio
+async def test_scanner_overlays_setups_into_context_and_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    closes = [10 + i * 0.1 for i in range(260)]          # uptrend -> enters, journals context
+    sc, journal, *_ = _scanner(tmp_path, closes, CRIT)
+    await sc.run_once()
+    read = sc.last_setups["X"]                           # cached for /api/setups
+    assert set(read) >= {"flags", "features", "setups", "fired_now", "live", "bias", "score",
+                         "primary", "partial_bar"}
+    assert read["partial_bar"] is True                   # market open -> last bar treated as partial
+    row = journal.recent()[0]
+    assert isinstance(row.context.get("setups"), list)   # journaled automatically via as_dict()
+    assert row.context.get("setup_bias") in ("favorable", "avoid", "mixed", "none")
+    assert row.context.get("bb_percent_b") is not None   # bot-computed %B lands without TV
+
+
+@pytest.mark.asyncio
+async def test_scanner_avoid_setups_gate_and_setups_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    # ~200 flat bars then a sharp break below the 20-day range: a fresh breakdown / support break.
+    closes = [50 + (0.2 if i % 2 == 0 else -0.2) for i in range(200)] + [46.0, 44.0]
+    crit = CRIT.model_copy(update={"avoid_setups": ["breakdown", "breakdown_confirmed", "support_break"]})
+    (sc, journal, settings, killswitch, positions, orders, decisions,
+     entry_decisions, audit, signals) = _scanner(tmp_path, closes, crit)
+    submitted = await sc.run_once()
+    assert submitted == 0 and journal.recent() == []
+    assert any("avoid_setups" in s["reason"] for s in sc.last_skips)
+    deps = WebDeps(settings=settings, signals=signals, killswitch=killswitch, approval_gate=None,
+                   audit=audit, positions=positions, orders=orders, decisions=decisions,
+                   entry_decisions=entry_decisions, scanner=sc, trade_journal=journal)
+    d = TestClient(create_app(deps)).get("/api/setups").json()
+    assert d["enabled"] is True
+    x = d["symbols"][0]
+    assert x["symbol"] == "X" and x["gate"]["blocked"] is True
+    assert x["primary"] in ("support_break", "breakdown") and x["bias"] in ("avoid", "mixed")
+    assert x["live"]["breakdown_attempt"] is True        # today's partial bar is still breaking down
+
+
+@pytest.mark.asyncio
+async def test_scanner_records_setup_fires_once_per_bar_and_serves_accuracy(tmp_path, monkeypatch):
+    from agentic.store.db import Database as _DB
+    from agentic.store.setup_events import SetupEventStore
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    # range, then a completed breakout bar, then today's partial bar: "breakout" fires on the completed bar.
+    closes = [10.0 if i % 2 == 0 else 11.0 for i in range(70)] + [12.0, 12.1]
+    (sc, journal, settings, killswitch, positions, orders, decisions,
+     entry_decisions, audit, signals) = _scanner(tmp_path, closes, CRIT)
+    sc.setup_events = SetupEventStore(_DB(tmp_path / "se.db"))
+    await sc.run_once()
+    labels = {r["label"] for r in sc.setup_events.recent()}
+    assert "breakout" in labels                                   # recorded from the completed bar
+    n_first = len(sc.setup_events.recent())
+    await sc.run_once()                                           # same bar again -> no duplicates
+    assert len(sc.setup_events.recent()) == n_first
+    deps = WebDeps(settings=settings, signals=signals, killswitch=killswitch, approval_gate=None,
+                   audit=audit, positions=positions, orders=orders, decisions=decisions,
+                   entry_decisions=entry_decisions, scanner=sc, trade_journal=journal)
+    d = TestClient(create_app(deps)).get("/api/setups/accuracy").json()
+    assert d["available"] is True and d["recent"] and d["recent"][0]["symbol"] == "X"
+    assert all(r["n"] == 0 for r in d["rows"])                    # nothing resolved yet (no forward bars)
+
+
+@pytest.mark.asyncio
+async def test_scanner_merges_fresh_tv_setup_flags(tmp_path, monkeypatch):
+    import time as _time
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    # The bot reads a plain "breakout" (constant volume); a fresh TradingView daily flag with a 2.2x
+    # volume ratio upgrades it to breakout_confirmed, and an intraday attempt flag lights `live`.
+    closes = [10.0 if i % 2 == 0 else 11.0 for i in range(70)] + [12.0, 12.1]
+    now_ms = int(_time.time() * 1000)
+    seed = {"adx": 30.0, "breakout": 1, "vol_ratio_20": 2.2, "d_bar_time": now_ms - 3600_000,
+            "i_tf": 30, "i_bar_time": now_ms - 600_000, "i_breakout_attempt": 1}
+    (sc, journal, settings, killswitch, positions, orders, decisions,
+     entry_decisions, audit, signals) = _scanner(tmp_path, closes, CRIT, tv_seed=seed)
+    await sc.run_once()
+    ctx = sc.last_context["X"]
+    assert "breakout_confirmed" in ctx.setups and ctx.live_breakout_attempt is True
+    assert ctx.tv_setups["breakout"] is True and "tv_daily:breakout_confirmed" in ctx.setup_sources
+    row = journal.recent()[0]
+    assert "breakout_confirmed" in row.context["setups"]           # the merged read is what gets journaled
+    deps = WebDeps(settings=settings, signals=signals, killswitch=killswitch, approval_gate=None,
+                   audit=audit, positions=positions, orders=orders, decisions=decisions,
+                   entry_decisions=entry_decisions, scanner=sc, trade_journal=journal)
+    x = TestClient(create_app(deps)).get("/api/setups").json()["symbols"][0]
+    assert x["tv"]["present"] is True and x["tv"]["flags"]["breakout"] is True
+    assert x["live"]["breakout_attempt"] is True
+
+
+@pytest.mark.asyncio
+async def test_scanner_profiles_each_name_daily_and_serves_risk_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    closes = [10 + i * 0.1 for i in range(260)]
+    (sc, journal, settings, killswitch, positions, orders, decisions,
+     entry_decisions, audit, signals) = _scanner(tmp_path, closes, CRIT)
+    await sc.run_once()
+    prof = sc.last_risk_profile["X"]                        # profiled on its first scan
+    assert prof["symbol"] == "X" and prof["n"] > 0 and "suggested_cushion" in prof
+    stamp = prof["date"]
+    await sc.run_once()
+    assert sc.last_risk_profile["X"]["date"] == stamp        # cached for the day, not recomputed
+    deps = WebDeps(settings=settings, signals=signals, killswitch=killswitch, approval_gate=None,
+                   audit=audit, positions=positions, orders=orders, decisions=decisions,
+                   entry_decisions=entry_decisions, scanner=sc, trade_journal=journal)
+    d = TestClient(create_app(deps)).get("/api/risk-profile").json()
+    assert d["profiles"][0]["symbol"] == "X" and "put_seller_avoid_preset" in d["config"]
+    assert isinstance(d["proposals"], list)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_downtrend_skip_pauses_new_puts_only_when_enabled(tmp_path, monkeypatch):
+    """SPY (the stub serves the same downtrend bars for every symbol) has closed below its 200-day
+    for many sessions: with the knob ON every approved put is vetoed with a market-wide skip; with
+    it OFF (default) nothing changes."""
+    monkeypatch.setattr("agentic.services.scanner.is_market_hours", lambda: True)
+    closes = [100.0] * 252 + [90.0 - i * 0.5 for i in range(8)]      # 8 closes under the 200-day
+    for enabled in (False, True):
+        sc, journal, settings, *_ = _scanner(tmp_path / str(enabled), closes, CRIT)
+        settings.macro.skip_confirmed_downtrend = enabled
+
+        async def any_bars(underlying, lookback_days=260):       # the stub only serves "X"; SPY too
+            return _bars(closes)
+        sc.market_data.get_underlying_bars = any_bars
+        await sc.run_once()
+        reg = sc.last_regime
+        assert reg is not None and reg.confirmed_downtrend is True and reg.spy_days_below_sma200 == 8
+        market_skips = [s for s in sc.last_skips if s.get("symbol") == "*"]
+        if enabled:
+            assert market_skips and "confirmed downtrend" in market_skips[0]["reason"]
+            assert not journal.recent()                              # no entry journaled
+        else:
+            assert not market_skips
