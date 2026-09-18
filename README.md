@@ -60,7 +60,7 @@ It is deliberately a **slow, patient** strategy: 7–14 day expirations, held fo
 | **Executor** | Places and confirms orders through Robinhood; never leaves an order in an unknown state. |
 | **Reconcile** | Keeps the bot's ledger in sync with what Robinhood actually reports (assignments, expiries, fills). |
 | **Risk** | Position/sizing caps, entry gates, a **loss circuit breaker**, and an instant kill switch. |
-| **Dashboard** | A password-protected web page: health, positions, weekly **and** all-time P&L, the "why" behind every decision, an on-demand **Weekly tactical brief**, and a **Tuning** tab to change config live from your phone. |
+| **Dashboard** | A password-protected, phone-first web page: health, positions, weekly **and** all-time P&L, the "why" behind every decision, a daily **Setups** read with measured edge and per-name risk profiles, a **Weekly tactical brief** archive, and a **Tuning** tab to change config live from your phone. |
 
 All of it runs as **one small Docker container** that keeps its state (a local SQLite database + your login token) on a persistent volume. Market data — option chains, quotes, greeks, IV, open interest, and daily price bars — is pulled from **Robinhood's own connection** (`market_data.provider: robinhood`), so there are **no separate data subscriptions**.
 
@@ -294,6 +294,8 @@ entry:
     delta_min: 0.20
     delta_max: 0.30
     min_annualized_yield: 0.20
+    cc_below_basis_after_days: null # OFF. Assignment clock: after N days under water, allow calls
+    cc_otm_band: [0.05, 0.10]       # BELOW basis inside this band above spot (capital turns over)
   sizing:
     target_positions: 20         # spread capital across ~N names (scale-invariant)
     max_position_size_pct: 0.50  # per-name backstop cap
@@ -305,6 +307,17 @@ entry:
                                  # name; still no averaging-in over later days. null = one per name.
   per_ticker:                    # optional: override any `criteria` field for one name (merged over it)
     # NVDA: { delta_max: 0.22, min_iv_rank: 40 }
+  watchlist_tiers: {}            # names to PROPOSE once one contract fits under the per-name cap
+    # KO: { min_collateral: 7000, per_ticker: { min_annualized_yield: 0.20 } }
+
+macro:                           # market-regime read (SPY vs its 200-day, VIX term structure)
+  skip_confirmed_downtrend: false # opt-in: pause NEW puts after 5 straight SPY closes under the 200-day
+
+tax_reserve:                     # weekly gains sweep -- see "Operating the bot"
+  enabled: false
+  pct: 0.20                      # of the week's NET realized gains (losses carry forward)
+  symbol: SGOV                   # any stock/ETF: T-bills for taxes, or an index fund to reinvest
+  dry_run: true                  # first cycle: log + ledger only
 
 risk:                            # loss circuit breaker (freezes NEW entries; never force-closes)
   loss_breaker_enabled: true
@@ -370,9 +383,14 @@ If no fresh alert has arrived for a symbol, these gates simply **don't apply** (
 ## Operating the bot
 
 - **Dashboard** (`/`) -- tabbed and mobile-friendly:
-  - **Overview:** health, open positions, realized/unrealized P&L (this week **and** all-time), win rate, and the reason behind each close.
-  - **Brief:** an on-demand **Weekly tactical brief** (`/api/brief`) -- market backdrop, this week's catalysts, per-name expected-move **cushion** (strike distance in option-implied moves), earnings-inside-the-contract flags, open-position **management** (roll window / moneyness), and **assignment capacity** (collateral if every short put were assigned vs. buying power). Descriptive only -- not advice.
-  - **Tuning:** change config **live from your phone** -- no SSH, no restart. Multi-CSP cap, the entry gates, the delta band, and per-ticker overrides, each schema-validated and persisted to a writable overlay (safety-critical keys stay locked).
+  - **Overview:** health, open positions, realized/unrealized P&L (this week **and** all-time), win rate, the reason behind each close, the **gains-sweep reserve** (held, swept to date, this week's net, next sweep) and **Ready to add** (tier names the account can now afford).
+  - **Watchlist:** the daily read on every name you watch. **Setups today** labels each name from completed daily bars -- *washout* (oversold), *quiet base*, *support test*, *coiling* (volatility squeeze), *breakout* / *breakdown* (confirmed on volume) -- plus a **live** column for today's unfinished bar breaking a range or support right now. Labels carry a put-seller bias (favorable / avoid / neutral). Below it, **Which setups have edge here** scores every fire on what actually happened 5 and 10 bars later on *your* names (hit rate, average move, worst 10-day dip), and **Per-name risk profile** measures, for each name, how often a put a given expected-move cushion below spot was touched or finished in the money over the last year, and suggests a wider cushion for names that run hot. Every watchlist add is profiled automatically. Endpoints: `/api/setups`, `/api/setups/accuracy`, `/api/risk-profile`.
+  - **Brief:** the **Weekly tactical brief** (`/api/brief`) -- market backdrop, this week's catalysts, setups firing, per-name expected-move **cushion** (strike distance in option-implied moves), earnings-inside-the-contract flags, open-position **management** (roll window / moneyness), and **assignment capacity** (collateral if every short put were assigned vs. buying power). Every generated brief is **saved**: the tab opens on the latest one, a picker lists earlier ones (`/api/briefs`, `/api/briefs/{id}`), and **Generate new** builds a fresh one. Descriptive only -- not advice.
+  - **Tuning:** change config **live from your phone** -- no SSH, no restart. Multi-CSP cap, the entry gates, the **market regime** block (confirmed-downtrend skip), the **gains sweep** (on/off, percent, symbol, day/time, dry run), **setup gates** (`avoid_setups` / `require_setups`, a *prefer setups* ranking tilt, a one-tap *put-seller preset* that avoids the breakout family, and *apply suggested cushions* from the risk profile), the delta band, and per-ticker overrides, each schema-validated and persisted to a writable overlay (safety-critical keys stay locked). All setup gates are **off by default** and only ever tighten.
+  - **On a phone** the tabs sit in a bottom bar within thumb reach, every card folds on a tap (remembered per device), and wide tables keep their first column pinned while you scroll sideways.
+- **Gains sweep / tax reserve** (`tax_reserve`, off by default): every week at the time you set, the bot takes a share of that week's **net** realized gains (losses carry forward, so a red week is netted against the next green one) and buys that many dollars of a symbol you choose with a small regular-hours market order -- **SGOV** (T-bills) to set money aside for taxes, or an index fund to reinvest premium. The holding is **walled off**: it never counts as trading capital, is never written against, and the bot never sells it. One ledger row per week (`GET /api/tax-reserve`), so a restart can't double-buy. Run it with `dry_run: true` for a cycle first; the ledger shows what it *would* have bought.
+- **Ready to add** (`entry.watchlist_tiers`, optional): list quality names with the collateral one contract needs; once the account can hold one under the per-name cap, they show up on the Overview and Tuning tabs with a one-tap **Add** that carries their `per_ticker` overrides. The bot never adds names on its own (`GET /api/tiers`).
+- **Assignment clock** (`cc_below_basis_after_days`, opt-in, per ticker): by default calls are never sold below cost basis, which on volatile names can park capital for months. With a clock set, shares still under water that many days after assignment may be written against below basis inside a 5-10% OTM band, so the capital turns over. The holdings table shows each name's days held and whether below-basis calls are allowed.
 - **Open interest:** `GET /api/option-oi?symbol=SMR` returns the full call+put chain with OI, volume, IV and greeks (Robinhood-sourced; Alpaca's snapshots carry no OI).
 - **Pause / resume:** the kill switch halts *all* new orders instantly; use it any time you want to stop trading without touching positions.
 - **Loss circuit breaker:** trips automatically on a losing streak (see below) and shows in `/api/ops` — it freezes *new* entries but keeps managing what's open.
@@ -386,7 +404,8 @@ The bot is built to *survive*, not to gamble:
 
 - **Only sells names you list** — you curate the universe of what it can be assigned.
 - **Position + concentration caps** so no single trade dominates.
-- **Entry gates** — skips earnings, broken downtrends, illiquid contracts, and (opt-in) thin cushion or thin variance-risk-premium (the expected-move and IV/realized gates).
+- **Entry gates** — skips earnings, broken downtrends, illiquid contracts, and (opt-in) thin cushion or thin variance-risk-premium (the expected-move and IV/realized gates). An opt-in **confirmed-downtrend skip** pauses new puts market-wide once SPY has spent five straight sessions under its 200-day.
+- **Roll safety** — a roll that closes the old put but cannot open the new one is audited as an error and pushed to you as "Roll INCOMPLETE", never silently dropped.
 - **Loss circuit breaker** — freezes new entries after a bad realized run (default: −10% of account in 7 days, or 4 straight losers). It **never force-liquidates** — it stops digging, it doesn't panic-sell.
 - **Instant kill switch** — halts on broker errors or on your command.
 - **No hidden leverage** — cash-secured puts are fully collateralized.

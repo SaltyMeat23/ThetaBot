@@ -71,6 +71,13 @@ entry:
     min_volume: 10
     max_spread_pct: 0.10
     exclude_earnings_days: 7
+    # Assignment clock (opt-in). Normally calls are never sold below cost basis. Set a number of
+    # days and shares that are still under water that long after assignment may be written
+    # against BELOW basis, inside cc_otm_band above spot, so the capital turns over instead of
+    # sitting (measured on volatile names: ~35 days per cycle vs ~100 with the basis floor).
+    # Works per ticker too (per_ticker: {SMR: {cc_below_basis_after_days: 42}}).
+    cc_below_basis_after_days: null
+    cc_otm_band: [0.05, 0.10]
   sizing:
     max_position_size_pct: 0.10        # cap each CSP at 10% of account value
     max_concurrent_positions: 5        # max open CSPs
@@ -79,6 +86,11 @@ entry:
     buying_power_reserve_pct: 0.10     # always keep 10% of buying power unused
   # Per-ticker criteria overrides — merged over criteria/cc_criteria. Tune names you know well:
   per_ticker: {}             # e.g. {"NVDA": {"delta_max": 0.22}, "KO": {"dte_max": 21}}
+  # Capital-aware tiers (optional). Names you'd like to trade once the account can afford ONE
+  # contract under the per-name cap (max_pct_per_underlying, else max_position_size_pct).
+  # min_collateral = strike * 100 snapshot; live prices refresh it daily. The bot only PROPOSES:
+  # the Tuning tab lists them under "Ready to add" and a tap adds the name with its overrides.
+  watchlist_tiers: {}        # e.g. {"KO": {min_collateral: 7000, per_ticker: {min_annualized_yield: 0.20}}}
 
 # --- Market-regime read (systemic vs idiosyncratic) ---
 macro:
@@ -88,6 +100,9 @@ macro:
   risk_off_drawdown: 0.10     # SPY 20d drawdown >= 10% -> risk_off
   systemic_drawdown: 0.05     # market 20d dd >= 5% -> a stock's drop reads "systemic"
   hard_gate: false            # true = pause ALL new entries while risk_off (default off: flags only)
+  lookback_days: 330          # calendar days of index bars (>= 300 so the 200-day average exists)
+  skip_confirmed_downtrend: false   # opt-in: pause NEW puts once SPY has closed below its 200-day
+  downtrend_confirm_days: 5         # ...for this many straight sessions (flags only when off)
 
 # --- AI trade-analyst (advisory) ---
 # Reviews each screened + sized CSP candidate before submission and records a structured verdict.
@@ -111,6 +126,21 @@ roll:
   target_dte_max: 14
   min_net_credit: 0.0      # require net credit >= this (0 = never pay to roll)
   max_target_delta: 0.35   # don't roll into an even more-tested put
+
+# --- Gains sweep / tax reserve ---
+# Each week, a share of NET realized gains (losses carry forward) is moved into a symbol of your
+# choice by a small market order inside regular hours: SGOV (T-bills) to set aside taxes, or an
+# index fund to reinvest premium. The holding is walled off from trading capital, never written
+# against, never sold by the bot. One ledger row per week; run with dry_run: true for a cycle first.
+tax_reserve:
+  enabled: false
+  pct: 0.20                  # share of the week's net realized gains
+  symbol: SGOV               # any Robinhood-tradable stock or ETF
+  weekday: 4                 # 0=Mon .. 4=Fri
+  hour: 15                   # ET, inside regular hours (share market orders only fill then)
+  minute: 40
+  min_order_dollars: 5       # smaller amounts roll into the next week
+  dry_run: true              # log + ledger the intended order, place nothing
 
 # --- Scheduled push reports (hands-off heartbeat) ---
 # For when you can't watch during the day: a daily digest (so 'no news' means 'all fine', not
