@@ -52,8 +52,8 @@ entry:
                              # days — never hold a short put through earnings. Enforced only when an
                              # earnings source is live (RH MCP + ROBINHOOD_MCP_TOKEN); else no-op.
   criteria:                  # CSP (cash-secured put) screening
-    delta_min: 0.18          # short-put |delta| band
-    delta_max: 0.28
+    delta_min: 0.10          # short-put |delta| band. Measured on real option prints (docs/backtests.md):
+    delta_max: 0.20          # 0.10-0.20 beat 0.18-0.28 under both fair and worst fills; assignments 12% vs 19%.
     dte_min: 7               # weeklies (7-14 DTE) for weekly income
     dte_max: 14
     min_annualized_yield: 0.20   # (premium/strike)/dte*365 floor (0.20 = 20%)
@@ -61,6 +61,10 @@ entry:
     min_volume: 10
     max_spread_pct: 0.10     # bid-ask spread as fraction of mid
     exclude_earnings_days: 7  # (not yet enforced — needs an earnings calendar feed)
+    # Variance-risk-premium gate: only sell a put whose IV is at least this multiple of the name's
+    # 20-day realized vol. Pre-registered backtest on real prints: +1.90%/trade vs +1.20% ungated,
+    # assignments 13% -> 10%, ~1/3 fewer entries; the trades it removes are the loss tail. Set null to disable.
+    min_iv_rv_ratio: 1.3
   cc_criteria:               # covered-call screening (strike floor = cost basis, applied at runtime)
     delta_min: 0.20
     delta_max: 0.30

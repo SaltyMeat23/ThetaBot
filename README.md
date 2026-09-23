@@ -276,8 +276,8 @@ entry:
   prefer_iv_rank: true           # sell where premium is richest vs the name's own history
   earnings_gate: true            # never hold a short put through earnings
   criteria:                      # the CSP screen
-    delta_min: 0.18
-    delta_max: 0.28              # ~how likely you are to be assigned
+    delta_min: 0.10
+    delta_max: 0.20              # ~how likely you are to be assigned; 0.10-0.20 measured best (docs/backtests.md)
     dte_min: 7
     dte_max: 14
     min_annualized_yield: 0.52   # ~1%/week floor on collateral; lower it for more (thinner) trades
@@ -288,8 +288,9 @@ entry:
     require_strike_below_support: true
     min_strike_expected_moves: null # OFF. Require the strike >= N option-implied expected-moves OTM
                                     # (scales the cushion to each name's own volatility).
-    min_iv_rv_ratio: null           # OFF. Only sell when IV beats the name's realized vol by this
-                                    # ratio (e.g. 1.1) -- the variance-risk-premium edge.
+    min_iv_rv_ratio: 1.3            # Only sell when IV is >= 1.3x the name's 20-day realized vol: the
+                                    # variance-risk-premium edge. Measured: +1.90%/trade vs +1.20% off,
+                                    # fewer assignments, ~1/3 fewer entries. null = off.
   cc_criteria:                   # the covered-call screen (post-assignment)
     delta_min: 0.20
     delta_max: 0.30
@@ -330,7 +331,7 @@ rules:                           # position management
     params: { profit_pct: 0.8, trailing: true, trail_gap: 0.2 }   # take profit ~80% of max
 ```
 
-Tune the yield floor and delta band to your own risk tolerance. Higher `min_annualized_yield` = fewer, richer, higher-IV trades; lower = more, thinner ones.
+Tune the yield floor and delta band to your own risk tolerance. Higher `min_annualized_yield` = fewer, richer, higher-IV trades; lower = more, thinner ones. The defaults above are the ones that survived a real-option-print backtest under both fair and worst-case fills; **[docs/backtests.md](docs/backtests.md)** lists every lever tested, what held up, and what did not.
 
 ## Optional integrations (for different setups)
 
